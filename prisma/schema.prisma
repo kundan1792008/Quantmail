@@ -1,0 +1,84 @@
+generator client {
+  provider        = "prisma-client-js"
+  output          = "../src/generated/prisma/client"
+
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+/// Core user identity anchored to a biometric liveness proof.
+model User {
+  id              String        @id @default(uuid())
+  displayName     String
+  email           String        @unique
+  masterIdHash    String        @unique /// Propagated cross-app Master ID
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  livenessGrid    LivenessGrid?
+  digitalTwin     DigitalTwin?
+  inboxMessages   InboxMessage[]
+  shadowMessages  ShadowMessage[]
+}
+
+/// Biometric liveness proof tied to facial recognition matrix.
+model LivenessGrid {
+  id              String   @id @default(uuid())
+  userId          String   @unique
+  facialHash      String   @unique /// Cryptographic hash of facial matrix
+  livenessScore   Float    /// 0.0-1.0 confidence score
+  captureMethod   String   /// "capacitor_camera" | "web_camera"
+  verified        Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// 1-to-1 autonomous AI co-pilot linked to each user.
+model DigitalTwin {
+  id              String   @id @default(uuid())
+  userId          String   @unique
+  personality     String   @default("professional")
+  autoReplyOn     Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// Primary inbox – only verified senders land here.
+model InboxMessage {
+  id              String   @id @default(uuid())
+  userId          String
+  senderEmail     String
+  senderDomain    String
+  subject         String
+  body            String
+  receivedAt      DateTime @default(now())
+
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// Shadow inbox – unverified sender traffic quarantined here.
+model ShadowMessage {
+  id              String   @id @default(uuid())
+  userId          String
+  senderEmail     String
+  senderDomain    String
+  subject         String
+  body            String
+  reason          String   /// Why it was shadow-filtered
+  receivedAt      DateTime @default(now())
+
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// Registry of verified sender domains allowed into primary inbox.
+model VerifiedDomain {
+  id              String   @id @default(uuid())
+  domain          String   @unique
+  verifiedAt      DateTime @default(now())
+}

@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.db
+*.db-journal
+.env
+.capacitor/
+android/
+ios/
+src/generated/
