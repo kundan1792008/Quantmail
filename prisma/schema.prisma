@@ -1,0 +1,66 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id             String         @id @default(uuid())
+  displayName    String
+  email          String         @unique
+  biometricHash  String         @unique
+  verified       Boolean        @default(false)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  livenessGrid   LivenessGrid?
+  digitalTwin    DigitalTwin?
+  inboxMessages  InboxMessage[]
+}
+
+model LivenessGrid {
+  id               String   @id @default(uuid())
+  userId           String   @unique
+  facialMatrixHash String
+  livenessScore    Float
+  passed           Boolean
+  capturedAt       DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model DigitalTwin {
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  agentConfig String   @default("{}")
+  lastSyncAt  DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model InboxMessage {
+  id          String   @id @default(uuid())
+  userId      String
+  senderEmail String
+  subject     String
+  body        String
+  receivedAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model ShadowInbox {
+  id             String   @id @default(uuid())
+  senderEmail    String
+  recipientEmail String
+  subject        String
+  body           String
+  domain         String
+  reason         String   @default("UNVERIFIED_DOMAIN")
+  droppedAt      DateTime @default(now())
+}
