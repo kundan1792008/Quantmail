@@ -19,6 +19,7 @@ model User {
   livenessGrid   LivenessGrid?
   digitalTwin    DigitalTwin?
   inboxMessages  InboxMessage[]
+  quanttubeWatchEvents QuanttubeWatchEvent[]
 }
 
 model LivenessGrid {
@@ -63,4 +64,14 @@ model ShadowInbox {
   domain         String
   reason         String   @default("UNVERIFIED_DOMAIN")
   droppedAt      DateTime @default(now())
+}
+
+model QuanttubeWatchEvent {
+  id             String   @id @default(uuid())
+  userId         String
+  videoTitle     String
+  watchedSeconds Int
+  watchedAt      DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
 }
