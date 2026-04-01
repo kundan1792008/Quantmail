@@ -16,9 +16,10 @@ model User {
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
 
-  livenessGrid   LivenessGrid?
-  digitalTwin    DigitalTwin?
-  inboxMessages  InboxMessage[]
+  livenessGrid     LivenessGrid?
+  digitalTwin      DigitalTwin?
+  inboxMessages    InboxMessage[]
+  saccadeSessions  SaccadeSession[]
 }
 
 model LivenessGrid {
@@ -50,6 +51,17 @@ model InboxMessage {
   subject     String
   body        String
   receivedAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model SaccadeSession {
+  id              String   @id @default(uuid())
+  userId          String
+  saccadeHash     String
+  sampleCount     Int
+  entropyScore    Float
+  recordedAt      DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id])
 }

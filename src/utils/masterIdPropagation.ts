@@ -23,6 +23,7 @@ export const PROPAGATION_TARGETS = [
   "quanthealth",
   "quantlearn",
   "quantwork",
+  "quantedits",
 ] as const;
 
 export type AppTarget = (typeof PROPAGATION_TARGETS)[number];
