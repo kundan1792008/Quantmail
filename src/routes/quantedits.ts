@@ -21,6 +21,22 @@ import CryptoJS from "crypto-js";
 
 const SSO_SECRET = process.env["SSO_SECRET"] || "quantmail-dev-secret";
 
+/** Simple in-memory rate limiter for quantedits endpoints. */
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX = 20;
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return true;
+  }
+  entry.count++;
+  return entry.count <= RATE_LIMIT_MAX;
+}
+
 export async function quanteditsRoutes(app: FastifyInstance): Promise<void> {
   /**
    * POST /quantedits/saccade/record
@@ -34,6 +50,10 @@ export async function quanteditsRoutes(app: FastifyInstance): Promise<void> {
       samples: SaccadeSample[];
     };
   }>("/quantedits/saccade/record", async (request, reply) => {
+    if (!checkRateLimit(request.ip)) {
+      return reply.code(429).send({ error: "Rate limit exceeded" });
+    }
+
     const { token, samples } = request.body;
 
     if (!token) {
@@ -91,6 +111,10 @@ export async function quanteditsRoutes(app: FastifyInstance): Promise<void> {
       samples: SaccadeSample[];
     };
   }>("/quantedits/reel/apikey", async (request, reply) => {
+    if (!checkRateLimit(request.ip)) {
+      return reply.code(429).send({ error: "Rate limit exceeded" });
+    }
+
     const { token, samples } = request.body;
 
     if (!token) {
