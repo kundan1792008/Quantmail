@@ -9,10 +9,10 @@ describe("Master ID Propagation", () => {
   const userId = "user-abc-123";
   const secret = "test-propagation-secret";
 
-  it("should generate payloads for all 8 target apps", () => {
+  it("should generate payloads for all 9 target apps", () => {
     const payloads = propagateMasterIdToAll(userId, secret);
-    expect(payloads).toHaveLength(8);
-    expect(PROPAGATION_TARGETS).toHaveLength(8);
+    expect(payloads).toHaveLength(9);
+    expect(PROPAGATION_TARGETS).toHaveLength(9);
   });
 
   it("should include all expected target app names", () => {
@@ -26,13 +26,14 @@ describe("Master ID Propagation", () => {
     expect(names).toContain("quanthealth");
     expect(names).toContain("quantlearn");
     expect(names).toContain("quantwork");
+    expect(names).toContain("quantedits");
   });
 
   it("should produce unique tokens per app", () => {
     const payloads = propagateMasterIdToAll(userId, secret);
     const tokens = payloads.map((p) => p.token);
     const uniqueTokens = new Set(tokens);
-    expect(uniqueTokens.size).toBe(8);
+    expect(uniqueTokens.size).toBe(9);
   });
 
   it("should verify a propagated token for the correct app", () => {
