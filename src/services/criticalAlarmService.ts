@@ -1,5 +1,6 @@
 import { prisma } from "../db";
 import { sanitizeBody, type IncomingMessage } from "../interceptors/InboxInterceptor";
+import { randomUUID } from "node:crypto";
 
 const CRITICAL_KEYWORDS = [
   "critical payment",
@@ -12,13 +13,18 @@ const CRITICAL_KEYWORDS = [
   "unauthorized transfer",
 ];
 
+const SYNCHRONIZED_TRIGGER_DELAY_MS = Number.parseInt(
+  process.env["SYNCHRONIZED_TRIGGER_DELAY_MS"] || "1500",
+  10
+);
+
 function includesCriticalKeywords(text: string): boolean {
   const normalized = text.toLowerCase();
   return CRITICAL_KEYWORDS.some((keyword) => normalized.includes(keyword));
 }
 
-function buildSilenceChallenge(userId: string, alertId: string): string {
-  return `DASHBOARD_ONLY_${userId}_${alertId}`;
+function buildSilenceChallenge(userId: string): string {
+  return `DASHBOARD_ONLY_${userId}_${randomUUID()}`;
 }
 
 export function isCriticalPaymentOrTokenAlert(
@@ -49,7 +55,10 @@ export async function triggerSynchronizedWebBluetoothAlarm(params: {
     select: { id: true },
   });
 
-  const synchronizedTriggerAt = new Date(Date.now() + 1500);
+  const synchronizedTriggerAt = new Date(
+    Date.now() + SYNCHRONIZED_TRIGGER_DELAY_MS
+  );
+  const silenceChallenge = buildSilenceChallenge(params.userId);
 
   const alert = await prisma.criticalAlert.create({
     data: {
@@ -57,7 +66,7 @@ export async function triggerSynchronizedWebBluetoothAlarm(params: {
       source: params.source,
       subject: params.subject,
       body: sanitizeBody(params.body),
-      silenceChallenge: "__PENDING__",
+      silenceChallenge,
       triggeredFromMessageId: params.triggeredFromMessageId,
       dispatches: {
         create: devices.map((device) => ({
@@ -67,13 +76,6 @@ export async function triggerSynchronizedWebBluetoothAlarm(params: {
       },
     },
     select: { id: true },
-  });
-
-  const silenceChallenge = buildSilenceChallenge(params.userId, alert.id);
-
-  await prisma.criticalAlert.update({
-    where: { id: alert.id },
-    data: { silenceChallenge },
   });
 
   return {
@@ -88,6 +90,7 @@ export async function silenceAlarmFromDashboardPhysicalLogin(params: {
   userId: string;
   alertId: string;
   dashboardSessionId: string;
+  silenceChallenge: string;
 }): Promise<{ silenced: boolean; reason?: string }> {
   const session = await prisma.dashboardPhysicalLogin.findFirst({
     where: {
@@ -108,11 +111,14 @@ export async function silenceAlarmFromDashboardPhysicalLogin(params: {
 
   const alert = await prisma.criticalAlert.findUnique({
     where: { id: params.alertId },
-    select: { id: true, userId: true, alarmStatus: true },
+    select: { id: true, userId: true, alarmStatus: true, silenceChallenge: true },
   });
 
   if (!alert || alert.userId !== params.userId) {
     return { silenced: false, reason: "ALERT_NOT_FOUND" };
+  }
+  if (alert.silenceChallenge !== params.silenceChallenge) {
+    return { silenced: false, reason: "INVALID_SILENCE_CHALLENGE" };
   }
 
   if (alert.alarmStatus === "SILENCED") {

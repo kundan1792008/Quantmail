@@ -57,7 +57,7 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: "Recipient not found" });
     }
 
-    await prisma.inboxMessage.create({
+    const createdMessage = await prisma.inboxMessage.create({
       data: {
         userId: user.id,
         senderEmail: message.senderEmail,
@@ -72,6 +72,7 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
         source: "inbox_webhook",
         subject: message.subject || "(no subject)",
         body: message.body || "",
+        triggeredFromMessageId: createdMessage.id,
       });
       return reply.code(201).send({
         status: "delivered_with_critical_alarm",
