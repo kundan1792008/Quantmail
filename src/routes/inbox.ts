@@ -5,6 +5,10 @@ import {
   sanitizeBody,
   type IncomingMessage,
 } from "../interceptors/InboxInterceptor";
+import {
+  detectCriticalAlert,
+  triggerSynchronizedAlarm,
+} from "../services/criticalAlertAlarmService";
 
 export async function inboxRoutes(app: FastifyInstance): Promise<void> {
   /**
@@ -53,7 +57,7 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: "Recipient not found" });
     }
 
-    await prisma.inboxMessage.create({
+    const storedMessage = await prisma.inboxMessage.create({
       data: {
         userId: user.id,
         senderEmail: message.senderEmail,
@@ -61,6 +65,28 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
         body: sanitizeBody(message.body || ""),
       },
     });
+
+    const critical = detectCriticalAlert(
+      storedMessage.subject,
+      storedMessage.body
+    );
+
+    if (critical.isCritical && critical.category) {
+      const alarm = await triggerSynchronizedAlarm({
+        userId: user.id,
+        messageId: storedMessage.id,
+        category: critical.category,
+        reason: critical.reason,
+      });
+
+      return reply.code(201).send({
+        status: "delivered_with_critical_alarm",
+        alertCategory: critical.category,
+        alarmSessionId: alarm.alarmSessionId,
+        synchronizedDevices: alarm.dispatchedDevices,
+        silencingPolicy: alarm.silencingPolicy,
+      });
+    }
 
     return reply.code(201).send({ status: "delivered" });
   });
