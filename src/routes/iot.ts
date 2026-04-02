@@ -20,7 +20,7 @@ export async function iotRoutes(app: FastifyInstance): Promise<void> {
     if (!name || !protocol || !endpointRef) {
       return reply
         .code(400)
-        .send({ error: "name, protocol and endpointRef required" });
+        .send({ error: "name, protocol, and endpointRef required" });
     }
 
     const user = await prisma.user.findUnique({ where: { id: userId } });
@@ -87,11 +87,17 @@ export async function iotRoutes(app: FastifyInstance): Promise<void> {
         return reply.send({ status: state });
       } catch (error) {
         const message = error instanceof Error ? error.message : "UNKNOWN_ERROR";
-        if (message === "PHYSICAL_LOGIN_REQUIRED") {
-          return reply.code(403).send({ error: "PHYSICAL_LOGIN_REQUIRED" });
+        if (
+          message === "PHYSICAL_LOGIN_NOT_FOUND" ||
+          message === "PHYSICAL_LOGIN_EXPIRED"
+        ) {
+          return reply.code(403).send({ error: message });
         }
         if (message === "ALARM_SESSION_NOT_FOUND") {
           return reply.code(404).send({ error: "Alarm session not found" });
+        }
+        if (message === "USER_NOT_FOUND") {
+          return reply.code(404).send({ error: "User not found" });
         }
         return reply.code(500).send({ error: "Failed to silence alarm" });
       }

@@ -78,7 +78,16 @@ export async function createDashboardPhysicalLoginToken(
 ): Promise<{ token: string; expiresAt: Date }> {
   const now = Date.now();
   const expiresAt = new Date(now + PHYSICAL_LOGIN_TTL_MS);
-  const token = deriveBiometricHash(`${userId}:${now}:${randomUUID()}`);
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { biometricHash: true },
+  });
+  if (!user) {
+    throw new Error("USER_NOT_FOUND");
+  }
+  const token = deriveBiometricHash(
+    `${user.biometricHash}:${now}:${randomUUID()}`
+  );
 
   await prisma.dashboardPhysicalLogin.create({
     data: {
@@ -107,8 +116,11 @@ export async function silenceAlarmWithPhysicalLogin(args: {
     orderBy: { verifiedAt: "desc" },
   });
 
-  if (!login || login.expiresAt < now) {
-    throw new Error("PHYSICAL_LOGIN_REQUIRED");
+  if (!login) {
+    throw new Error("PHYSICAL_LOGIN_NOT_FOUND");
+  }
+  if (login.expiresAt < now) {
+    throw new Error("PHYSICAL_LOGIN_EXPIRED");
   }
 
   await prisma.dashboardPhysicalLogin.update({
