@@ -5,6 +5,10 @@ import {
   sanitizeBody,
   type IncomingMessage,
 } from "../interceptors/InboxInterceptor";
+import {
+  isCriticalPaymentOrTokenAlert,
+  triggerSynchronizedWebBluetoothAlarm,
+} from "../services/criticalAlarmService";
 
 export async function inboxRoutes(app: FastifyInstance): Promise<void> {
   /**
@@ -61,6 +65,19 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
         body: sanitizeBody(message.body || ""),
       },
     });
+
+    if (isCriticalPaymentOrTokenAlert(message)) {
+      const alarm = await triggerSynchronizedWebBluetoothAlarm({
+        userId: user.id,
+        source: "inbox_webhook",
+        subject: message.subject || "(no subject)",
+        body: message.body || "",
+      });
+      return reply.code(201).send({
+        status: "delivered_with_critical_alarm",
+        alarm,
+      });
+    }
 
     return reply.code(201).send({ status: "delivered" });
   });

@@ -19,6 +19,9 @@ model User {
   livenessGrid   LivenessGrid?
   digitalTwin    DigitalTwin?
   inboxMessages  InboxMessage[]
+  iotDevices     ConnectedIoTDevice[]
+  criticalAlerts CriticalAlert[]
+  dashboardLogins DashboardPhysicalLogin[]
 }
 
 model LivenessGrid {
@@ -63,4 +66,86 @@ model ShadowInbox {
   domain         String
   reason         String   @default("UNVERIFIED_DOMAIN")
   droppedAt      DateTime @default(now())
+}
+
+enum DeviceType {
+  APPLE_WATCH
+  IOT_DEVICE
+}
+
+enum AlarmStatus {
+  ACTIVE
+  SILENCED
+}
+
+enum DispatchStatus {
+  PENDING
+  ACKNOWLEDGED
+  SILENCED
+}
+
+enum LoginMethod {
+  PHYSICAL
+}
+
+model ConnectedIoTDevice {
+  id                  String     @id @default(uuid())
+  userId              String
+  deviceName          String
+  deviceIdentifier    String
+  deviceType          DeviceType
+  capacitorDeviceId   String?
+  webBluetoothEnabled Boolean    @default(true)
+  isActive            Boolean    @default(true)
+  lastSeenAt          DateTime   @default(now())
+  createdAt           DateTime   @default(now())
+  updatedAt           DateTime   @updatedAt
+
+  user       User           @relation(fields: [userId], references: [id])
+  dispatches AlarmDispatch[]
+
+  @@unique([userId, deviceIdentifier])
+}
+
+model CriticalAlert {
+  id                     String         @id @default(uuid())
+  userId                 String
+  source                 String
+  subject                String
+  body                   String
+  alarmStatus            AlarmStatus    @default(ACTIVE)
+  silenceChallenge       String
+  triggeredFromMessageId String?
+  triggeredAt            DateTime       @default(now())
+  silencedAt             DateTime?
+
+  user       User            @relation(fields: [userId], references: [id])
+  dispatches AlarmDispatch[]
+}
+
+model AlarmDispatch {
+  id                   String         @id @default(uuid())
+  alertId              String
+  deviceId             String
+  protocol             String         @default("WEB_BLUETOOTH")
+  synchronizedTriggerAt DateTime
+  status               DispatchStatus @default(PENDING)
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
+
+  alert  CriticalAlert      @relation(fields: [alertId], references: [id])
+  device ConnectedIoTDevice @relation(fields: [deviceId], references: [id])
+}
+
+model DashboardPhysicalLogin {
+  id             String      @id @default(uuid())
+  userId         String
+  dashboardOrigin String
+  loginMethod    LoginMethod @default(PHYSICAL)
+  deviceProof    String
+  expiresAt      DateTime
+  createdAt      DateTime    @default(now())
+  revokedAt      DateTime?
+
+  user User @relation(fields: [userId], references: [id])
 }
