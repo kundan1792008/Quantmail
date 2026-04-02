@@ -1,6 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { prisma } from "../db";
 import { silenceCriticalAlarmFromDashboard } from "../services/criticalAlertService";
+import { deriveBiometricHash } from "../utils/crypto";
 
 export async function iotRoutes(app: FastifyInstance): Promise<void> {
   app.post<{
@@ -9,7 +10,7 @@ export async function iotRoutes(app: FastifyInstance): Promise<void> {
       deviceName: string;
       platform: "apple_watch" | "ios" | "android" | "web_iot";
       endpointRef: string;
-      connectionType?: "webbluetooth";
+      connectionType?: "WebBluetooth";
     };
   }>("/iot/register", async (request, reply) => {
     const { userId, deviceName, platform, endpointRef, connectionType } =
@@ -21,9 +22,21 @@ export async function iotRoutes(app: FastifyInstance): Promise<void> {
       });
     }
 
-    const user = await prisma.user.findUnique({ where: { id: userId } });
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { livenessGrid: true },
+    });
     if (!user) {
       return reply.code(404).send({ error: "User not found" });
+    }
+    if (!user.verified || !user.livenessGrid || !user.livenessGrid.passed) {
+      return reply.code(403).send({ error: "STRICT_BOT_DROP" });
+    }
+    const expectedBiometricHash = deriveBiometricHash(
+      `${user.email}:${user.livenessGrid.facialMatrixHash}`
+    );
+    if (expectedBiometricHash !== user.biometricHash) {
+      return reply.code(403).send({ error: "STRICT_BOT_DROP" });
     }
 
     const device = await prisma.ioTDevice.create({
@@ -32,7 +45,7 @@ export async function iotRoutes(app: FastifyInstance): Promise<void> {
         deviceName,
         platform,
         endpointRef,
-        connectionType: connectionType || "webbluetooth",
+        connectionType: connectionType || "WebBluetooth",
         active: true,
       },
     });

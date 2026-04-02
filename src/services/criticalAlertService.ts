@@ -1,4 +1,5 @@
 import { prisma } from "../db";
+import { deriveBiometricHash, verifyMasterSSOToken } from "../utils/crypto";
 
 const CRITICAL_ALERT_PATTERNS: readonly RegExp[] = [
   /\bcritical\b/i,
@@ -16,6 +17,9 @@ export interface CriticalAlertPayload {
   body: string;
 }
 
+const SSO_SECRET = process.env["SSO_SECRET"] || "quantmail-dev-secret";
+const SILENCE_TOKEN_MAX_AGE_MILLISECONDS = 5 * 60 * 1000;
+
 export function isCriticalPaymentOrEcosystemTokenAlert(
   subject: string,
   body: string
@@ -28,6 +32,20 @@ export function isCriticalPaymentOrEcosystemTokenAlert(
   return matches >= 2;
 }
 
+async function hasValidBiometricIntegrity(userId: string): Promise<boolean> {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    include: { livenessGrid: true },
+  });
+  if (!user || !user.verified || !user.livenessGrid || !user.livenessGrid.passed) {
+    return false;
+  }
+  const expectedBiometricHash = deriveBiometricHash(
+    `${user.email}:${user.livenessGrid.facialMatrixHash}`
+  );
+  return user.biometricHash === expectedBiometricHash;
+}
+
 export async function triggerSynchronizedWebBluetoothAlarm(
   payload: CriticalAlertPayload
 ): Promise<{
@@ -35,11 +53,16 @@ export async function triggerSynchronizedWebBluetoothAlarm(
   synchronizedDevices: number;
   requiresPhysicalDashboardLogin: boolean;
 }> {
+  const biometricIntegrity = await hasValidBiometricIntegrity(payload.userId);
+  if (!biometricIntegrity) {
+    throw new Error("STRICT_BOT_DROP");
+  }
+
   const activeDevices = await prisma.ioTDevice.findMany({
     where: {
       userId: payload.userId,
       active: true,
-      connectionType: "webbluetooth",
+      connectionType: "WebBluetooth",
     },
   });
 
@@ -53,7 +76,7 @@ export async function triggerSynchronizedWebBluetoothAlarm(
       dispatches: {
         create: activeDevices.map((device) => ({
           deviceId: device.id,
-          channel: "webbluetooth",
+          channel: "WebBluetooth",
           status: "TRIGGERED",
           payload: JSON.stringify({
             alarmSignal: "QUANTMAIL_CRITICAL_ALERT",
@@ -78,8 +101,18 @@ export async function silenceCriticalAlarmFromDashboard(
   alarmSessionId: string,
   physicalDashboardLoginToken: string
 ): Promise<{ silenced: boolean; status: string }> {
-  if (!physicalDashboardLoginToken || physicalDashboardLoginToken.length < 16) {
+  const tokenUserId = verifyMasterSSOToken(
+    physicalDashboardLoginToken,
+    SSO_SECRET,
+    SILENCE_TOKEN_MAX_AGE_MILLISECONDS
+  );
+  if (!tokenUserId || tokenUserId !== userId) {
     return { silenced: false, status: "PHYSICAL_LOGIN_REQUIRED" };
+  }
+
+  const biometricIntegrity = await hasValidBiometricIntegrity(userId);
+  if (!biometricIntegrity) {
+    return { silenced: false, status: "STRICT_BOT_DROP" };
   }
 
   const alarm = await prisma.criticalAlarmSession.findFirst({

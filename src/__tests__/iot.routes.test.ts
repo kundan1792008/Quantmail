@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { deriveBiometricHash } from "../utils/crypto";
 
 const mockedPrisma = vi.hoisted(() => ({
   userFindUnique: vi.fn(),
@@ -52,15 +53,23 @@ describe("iotRoutes silence flow", () => {
   });
 
   it("should register an iot device for a valid user", async () => {
+    const email = "u@q.com";
+    const facialMatrixHash = "grid-1";
     mockedPrisma.userFindUnique.mockResolvedValue({
       id: "user-1",
-      email: "u@q.com",
+      email,
+      verified: true,
+      biometricHash: deriveBiometricHash(`${email}:${facialMatrixHash}`),
+      livenessGrid: {
+        facialMatrixHash,
+        passed: true,
+      },
     });
     mockedPrisma.ioTDeviceCreate.mockResolvedValue({
       id: "dev-1",
       deviceName: "Apple Watch",
       platform: "apple_watch",
-      connectionType: "webbluetooth",
+      connectionType: "WebBluetooth",
     });
 
     const app = Fastify();
@@ -84,7 +93,7 @@ describe("iotRoutes silence flow", () => {
         id: "dev-1",
         deviceName: "Apple Watch",
         platform: "apple_watch",
-        connectionType: "webbluetooth",
+        connectionType: "WebBluetooth",
       },
     });
   });
@@ -132,5 +141,35 @@ describe("iotRoutes silence flow", () => {
     expect(response.json()).toEqual({
       sessions: [{ id: "alarm-1", status: "ACTIVE", dispatches: [] }],
     });
+  });
+
+  it("should reject registration when biometric integrity is invalid", async () => {
+    mockedPrisma.userFindUnique.mockResolvedValue({
+      id: "user-1",
+      email: "u@q.com",
+      verified: true,
+      biometricHash: "mismatch",
+      livenessGrid: {
+        facialMatrixHash: "grid-1",
+        passed: true,
+      },
+    });
+
+    const app = Fastify();
+    await app.register(iotRoutes);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/iot/register",
+      payload: {
+        userId: "user-1",
+        deviceName: "Apple Watch",
+        platform: "apple_watch",
+        endpointRef: "watch://endpoint",
+      },
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toEqual({ error: "STRICT_BOT_DROP" });
   });
 });

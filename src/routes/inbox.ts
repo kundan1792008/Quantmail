@@ -66,7 +66,7 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
       },
     });
 
-    let alarm:
+    let triggeredAlarm:
       | {
           alarmSessionId: string;
           synchronizedDevices: number;
@@ -80,7 +80,7 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
         storedMessage.body
       )
     ) {
-      alarm = await triggerSynchronizedWebBluetoothAlarm({
+      triggeredAlarm = await triggerSynchronizedWebBluetoothAlarm({
         userId: user.id,
         inboxMessageId: storedMessage.id,
         subject: storedMessage.subject,
@@ -90,8 +90,8 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
 
     return reply.code(201).send({
       status: "delivered",
-      criticalAlarmTriggered: Boolean(alarm),
-      alarm,
+      criticalAlarmTriggered: Boolean(triggeredAlarm),
+      alarm: triggeredAlarm,
     });
   });
 

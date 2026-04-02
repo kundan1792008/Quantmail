@@ -60,4 +60,11 @@ describe("Master SSO Token", () => {
     expect(verifyMasterSSOToken("single-part", secret)).toBeNull();
     expect(verifyMasterSSOToken("a.b.c", secret)).toBeNull();
   });
+
+  it("should reject expired token when maxAge is enforced", async () => {
+    const token = generateMasterSSOToken(userId, secret);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const result = verifyMasterSSOToken(token, secret, 1);
+    expect(result).toBeNull();
+  });
 });

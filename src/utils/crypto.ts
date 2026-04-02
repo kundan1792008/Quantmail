@@ -35,7 +35,8 @@ export function generateMasterSSOToken(
  */
 export function verifyMasterSSOToken(
   token: string,
-  secret: string
+  secret: string,
+  maxAgeMs?: number
 ): string | null {
   const parts = token.split(".");
   if (parts.length !== 2) return null;
@@ -46,7 +47,11 @@ export function verifyMasterSSOToken(
       CryptoJS.enc.Hex
     );
     if (signature !== expectedSig) return null;
-    const parsed = JSON.parse(payload) as { sub: string };
+    const parsed = JSON.parse(payload) as { sub: string; iat?: number };
+    if (maxAgeMs !== undefined) {
+      if (typeof parsed.iat !== "number") return null;
+      if (Date.now() - parsed.iat > maxAgeMs) return null;
+    }
     return parsed.sub;
   } catch {
     return null;

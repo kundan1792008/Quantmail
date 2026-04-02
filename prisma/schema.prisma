@@ -79,7 +79,7 @@ model IoTDevice {
   userId         String
   deviceName     String
   platform       String
-  connectionType String   @default("webbluetooth")
+  connectionType String   @default("WebBluetooth")
   endpointRef    String
   active         Boolean  @default(true)
   createdAt      DateTime @default(now())
