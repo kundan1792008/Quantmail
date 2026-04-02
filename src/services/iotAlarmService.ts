@@ -86,7 +86,8 @@ export async function createDashboardPhysicalLoginToken(
     throw new Error("USER_NOT_FOUND");
   }
   const tokenSeed = `${userId}:${now}:${randomUUID()}`;
-  const token = deriveBiometricHash(`${tokenSeed}:${deriveBiometricHash(user.biometricHash)}`);
+  const biometricBinding = deriveBiometricHash(`${user.biometricHash}:${userId}`);
+  const token = deriveBiometricHash(`${tokenSeed}:${biometricBinding}`);
 
   await prisma.dashboardPhysicalLogin.create({
     data: {

@@ -8,6 +8,28 @@ import {
 import { detectCriticalAlert } from "../services/criticalAlertService";
 import { triggerSynchronizedAlarmForCriticalAlert } from "../services/iotAlarmService";
 
+function buildCriticalAlertResponse(args: {
+  triggered: boolean;
+  category?: "PAYMENT" | "ECOSYSTEM_TOKEN";
+  alarmSessionId?: string;
+  syncGroup?: string;
+  dispatchedDevices?: number;
+}): {
+  triggered: boolean;
+  category: "PAYMENT" | "ECOSYSTEM_TOKEN" | null;
+  alarmSessionId: string | null;
+  syncGroup: string | null;
+  dispatchedDevices: number;
+} {
+  return {
+    triggered: args.triggered,
+    category: args.category ?? null,
+    alarmSessionId: args.alarmSessionId ?? null,
+    syncGroup: args.syncGroup ?? null,
+    dispatchedDevices: args.dispatchedDevices ?? 0,
+  };
+}
+
 export async function inboxRoutes(app: FastifyInstance): Promise<void> {
   /**
    * POST /inbox/receive
@@ -83,17 +105,20 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
 
       return reply.code(201).send({
         status: "delivered",
-        criticalAlert: {
+        criticalAlert: buildCriticalAlertResponse({
           triggered: true,
           category: criticalSignal.category,
           alarmSessionId: alarm.alarmSessionId,
           syncGroup: alarm.syncGroup,
           dispatchedDevices: alarm.dispatchedCount,
-        },
+        }),
       });
     }
 
-    return reply.code(201).send({ status: "delivered", criticalAlert: { triggered: false } });
+    return reply.code(201).send({
+      status: "delivered",
+      criticalAlert: buildCriticalAlertResponse({ triggered: false }),
+    });
   });
 
   /**

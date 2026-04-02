@@ -12,7 +12,12 @@ const PAYMENT_PATTERNS: ReadonlyArray<RegExp> = [
 
 const TOKEN_PATTERNS: ReadonlyArray<RegExp> = [
   /\becosystem token\b/i,
+  /\becosystem[_-]?token\b/i,
+  /\becosystemtoken\b/i,
   /\btoken\b/i,
+  /\bx402\b/i,
+  /\bquantpay\b/i,
+  /\bqtoken\b/i,
   /\bwallet\b/i,
   /\btransfer\b/i,
   /\bstake\b/i,

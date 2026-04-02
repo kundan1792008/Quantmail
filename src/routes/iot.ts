@@ -6,7 +6,11 @@ import {
 } from "../services/iotAlarmService";
 import { verifyMasterSSOToken } from "../utils/crypto";
 
-const SSO_SECRET = process.env["SSO_SECRET"] || "quantmail-dev-secret";
+const SSO_SECRET = process.env["SSO_SECRET"];
+if (!SSO_SECRET) {
+  throw new Error("SSO_SECRET environment variable is required");
+}
+const REQUIRED_SSO_SECRET: string = SSO_SECRET;
 
 function getUserIdFromAuthorizationHeader(
   authorizationHeader: string | undefined
@@ -14,7 +18,7 @@ function getUserIdFromAuthorizationHeader(
   if (!authorizationHeader) return null;
   const [scheme, token] = authorizationHeader.split(" ");
   if (scheme !== "Bearer" || !token) return null;
-  return verifyMasterSSOToken(token, SSO_SECRET);
+  return verifyMasterSSOToken(token, REQUIRED_SSO_SECRET);
 }
 
 export async function iotRoutes(app: FastifyInstance): Promise<void> {
@@ -75,32 +79,45 @@ export async function iotRoutes(app: FastifyInstance): Promise<void> {
 
   app.post<{
     Params: { userId: string };
-  }>("/dashboard/:userId/physical-login", async (request, reply) => {
-    const { userId } = request.params;
-    const authenticatedUserId = getUserIdFromAuthorizationHeader(
-      request.headers.authorization
-    );
-    if (!authenticatedUserId || authenticatedUserId !== userId) {
-      return reply.code(401).send({ error: "Unauthorized" });
-    }
-    const user = await prisma.user.findUnique({ where: { id: userId } });
-    if (!user) {
-      return reply.code(404).send({ error: "User not found" });
-    }
+  }>("/dashboard/:userId/physical-login", {
+    config: {
+      rateLimit: {
+        max: 20,
+        timeWindow: "1 minute",
+      },
+    },
+    handler: async (request, reply) => {
+      const { userId } = request.params;
+      const authenticatedUserId = getUserIdFromAuthorizationHeader(
+        request.headers.authorization
+      );
+      if (!authenticatedUserId || authenticatedUserId !== userId) {
+        return reply.code(401).send({ error: "Unauthorized" });
+      }
+      const user = await prisma.user.findUnique({ where: { id: userId } });
+      if (!user) {
+        return reply.code(404).send({ error: "User not found" });
+      }
 
-    const token = await createDashboardPhysicalLoginToken(userId);
-    return reply.code(201).send({
-      status: "PHYSICAL_LOGIN_VERIFIED",
-      token,
-    });
+      const token = await createDashboardPhysicalLoginToken(userId);
+      return reply.code(201).send({
+        status: "PHYSICAL_LOGIN_VERIFIED",
+        token,
+      });
+    },
   });
 
   app.post<{
     Params: { userId: string; alarmSessionId: string };
     Body: { physicalLoginToken: string };
-  }>(
-    "/iot/:userId/alarms/:alarmSessionId/silence",
-    async (request, reply) => {
+  }>("/iot/:userId/alarms/:alarmSessionId/silence", {
+    config: {
+      rateLimit: {
+        max: 20,
+        timeWindow: "1 minute",
+      },
+    },
+    handler: async (request, reply) => {
       const { userId, alarmSessionId } = request.params;
       const { physicalLoginToken } = request.body;
       const authenticatedUserId = getUserIdFromAuthorizationHeader(
@@ -132,11 +149,8 @@ export async function iotRoutes(app: FastifyInstance): Promise<void> {
         if (message === "ALARM_SESSION_NOT_FOUND") {
           return reply.code(404).send({ error: "Alarm session not found" });
         }
-        if (message === "USER_NOT_FOUND") {
-          return reply.code(404).send({ error: "User not found" });
-        }
         return reply.code(500).send({ error: "Failed to silence alarm" });
       }
-    }
-  );
+    },
+  });
 }
