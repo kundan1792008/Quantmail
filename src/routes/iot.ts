@@ -4,6 +4,18 @@ import {
   createDashboardPhysicalLoginToken,
   silenceAlarmWithPhysicalLogin,
 } from "../services/iotAlarmService";
+import { verifyMasterSSOToken } from "../utils/crypto";
+
+const SSO_SECRET = process.env["SSO_SECRET"] || "quantmail-dev-secret";
+
+function getUserIdFromAuthorizationHeader(
+  authorizationHeader: string | undefined
+): string | null {
+  if (!authorizationHeader) return null;
+  const [scheme, token] = authorizationHeader.split(" ");
+  if (scheme !== "Bearer" || !token) return null;
+  return verifyMasterSSOToken(token, SSO_SECRET);
+}
 
 export async function iotRoutes(app: FastifyInstance): Promise<void> {
   app.post<{
@@ -16,6 +28,12 @@ export async function iotRoutes(app: FastifyInstance): Promise<void> {
   }>("/iot/:userId/devices", async (request, reply) => {
     const { userId } = request.params;
     const { name, protocol, endpointRef } = request.body;
+    const authenticatedUserId = getUserIdFromAuthorizationHeader(
+      request.headers.authorization
+    );
+    if (!authenticatedUserId || authenticatedUserId !== userId) {
+      return reply.code(401).send({ error: "Unauthorized" });
+    }
 
     if (!name || !protocol || !endpointRef) {
       return reply
@@ -39,6 +57,12 @@ export async function iotRoutes(app: FastifyInstance): Promise<void> {
     Params: { userId: string };
   }>("/iot/:userId/alarms/active", async (request, reply) => {
     const { userId } = request.params;
+    const authenticatedUserId = getUserIdFromAuthorizationHeader(
+      request.headers.authorization
+    );
+    if (!authenticatedUserId || authenticatedUserId !== userId) {
+      return reply.code(401).send({ error: "Unauthorized" });
+    }
 
     const alarms = await prisma.alarmSession.findMany({
       where: { userId, state: "ACTIVE" },
@@ -53,6 +77,12 @@ export async function iotRoutes(app: FastifyInstance): Promise<void> {
     Params: { userId: string };
   }>("/dashboard/:userId/physical-login", async (request, reply) => {
     const { userId } = request.params;
+    const authenticatedUserId = getUserIdFromAuthorizationHeader(
+      request.headers.authorization
+    );
+    if (!authenticatedUserId || authenticatedUserId !== userId) {
+      return reply.code(401).send({ error: "Unauthorized" });
+    }
     const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user) {
       return reply.code(404).send({ error: "User not found" });
@@ -73,6 +103,12 @@ export async function iotRoutes(app: FastifyInstance): Promise<void> {
     async (request, reply) => {
       const { userId, alarmSessionId } = request.params;
       const { physicalLoginToken } = request.body;
+      const authenticatedUserId = getUserIdFromAuthorizationHeader(
+        request.headers.authorization
+      );
+      if (!authenticatedUserId || authenticatedUserId !== userId) {
+        return reply.code(401).send({ error: "Unauthorized" });
+      }
 
       if (!physicalLoginToken) {
         return reply.code(400).send({ error: "physicalLoginToken required" });

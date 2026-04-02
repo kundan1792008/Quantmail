@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
+import rateLimit from "@fastify/rate-limit";
 import { authRoutes } from "./routes/auth";
 import { inboxRoutes } from "./routes/inbox";
 import { digitalTwinRoutes } from "./routes/digitalTwin";
@@ -9,6 +10,10 @@ const app = Fastify({ logger: true });
 
 async function main(): Promise<void> {
   await app.register(cors, { origin: true });
+  await app.register(rateLimit, {
+    max: 100,
+    timeWindow: "1 minute",
+  });
   await app.register(authRoutes);
   await app.register(inboxRoutes);
   await app.register(digitalTwinRoutes);
