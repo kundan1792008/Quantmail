@@ -19,6 +19,8 @@ model User {
   livenessGrid   LivenessGrid?
   digitalTwin    DigitalTwin?
   inboxMessages  InboxMessage[]
+  iotDevices     IoTDevice[]
+  criticalAlarms CriticalAlarmSession[]
 }
 
 model LivenessGrid {
@@ -51,7 +53,8 @@ model InboxMessage {
   body        String
   receivedAt  DateTime @default(now())
 
-  user User @relation(fields: [userId], references: [id])
+  user           User                   @relation(fields: [userId], references: [id])
+  criticalAlarms CriticalAlarmSession[]
 }
 
 model ShadowInbox {
@@ -63,4 +66,63 @@ model ShadowInbox {
   domain         String
   reason         String   @default("UNVERIFIED_DOMAIN")
   droppedAt      DateTime @default(now())
+}
+
+enum AlarmStatus {
+  ACTIVE
+  SILENCED
+  EXPIRED
+}
+
+model IoTDevice {
+  id             String   @id @default(uuid())
+  userId         String
+  deviceName     String
+  platform       String
+  connectionType String   @default("webbluetooth")
+  endpointRef    String
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user           User            @relation(fields: [userId], references: [id])
+  alarmDispatches AlarmDispatch[]
+
+  @@index([userId, active])
+}
+
+model CriticalAlarmSession {
+  id                    String      @id @default(uuid())
+  userId                String
+  inboxMessageId        String?
+  alertType             String      @default("CRITICAL_PAYMENT_ECOSYSTEM_TOKEN_ALERT")
+  status                AlarmStatus @default(ACTIVE)
+  triggeredAt           DateTime    @default(now())
+  silencedAt            DateTime?
+  silencedBy            String?
+  silenceOrigin         String?
+  requiresPhysicalLogin Boolean     @default(true)
+
+  user        User          @relation(fields: [userId], references: [id])
+  inboxMessage InboxMessage? @relation(fields: [inboxMessageId], references: [id])
+  dispatches  AlarmDispatch[]
+
+  @@index([userId, status])
+}
+
+model AlarmDispatch {
+  id             String   @id @default(uuid())
+  alarmSessionId String
+  deviceId       String
+  dispatchedAt   DateTime @default(now())
+  acknowledgedAt DateTime?
+  channel        String
+  status         String   @default("TRIGGERED")
+  payload        String   @default("{}")
+
+  alarmSession CriticalAlarmSession @relation(fields: [alarmSessionId], references: [id])
+  device       IoTDevice            @relation(fields: [deviceId], references: [id])
+
+  @@index([alarmSessionId])
+  @@index([deviceId])
 }
