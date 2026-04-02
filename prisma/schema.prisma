@@ -7,6 +7,26 @@ datasource db {
   provider = "sqlite"
 }
 
+enum ChallengeStatus {
+  PENDING
+  SATISFIED
+  ESCALATED
+  EXPIRED
+}
+
+enum NotificationPriority {
+  LOW
+  NORMAL
+  HIGH
+}
+
+enum NotificationStatus {
+  QUEUED
+  DISPATCHED
+  FAILED
+  ACKNOWLEDGED
+}
+
 model User {
   id             String         @id @default(uuid())
   displayName    String
@@ -19,6 +39,9 @@ model User {
   livenessGrid   LivenessGrid?
   digitalTwin    DigitalTwin?
   inboxMessages  InboxMessage[]
+  deviceTokens   DeviceToken[]
+  livenessChallenges LivenessChallenge[]
+  pushNotifications  PushNotification[]
 }
 
 model LivenessGrid {
@@ -63,4 +86,60 @@ model ShadowInbox {
   domain         String
   reason         String   @default("UNVERIFIED_DOMAIN")
   droppedAt      DateTime @default(now())
+}
+
+model DeviceToken {
+  id         String   @id @default(uuid())
+  userId     String
+  platform   String
+  token      String   @unique
+  lastSeenAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
+
+model LivenessChallenge {
+  id               String           @id @default(uuid())
+  userId           String
+  status           ChallengeStatus  @default(PENDING)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  expiresAt        DateTime
+  quantadsTarget   String           @default("quantads://campaign/identity-check")
+  quantchatTitle   String           @default("Quantchat SDK Warning")
+  quantchatBody    String           @default("Biometric liveness token ignored. Open to resolve.")
+  escalatedAt      DateTime?
+  satisfiedAt      DateTime?
+  lastPushAt       DateTime?
+  ssoToken         String?
+
+  user           User                @relation(fields: [userId], references: [id])
+  notifications  PushNotification[]
+
+  @@index([userId])
+  @@index([status, createdAt])
+}
+
+model PushNotification {
+  id              String              @id @default(uuid())
+  userId          String
+  challengeId     String?
+  title           String
+  body            String
+  payload         String
+  priority        NotificationPriority @default(NORMAL)
+  status          NotificationStatus   @default(QUEUED)
+  channel         String               @default("quantchat-warning")
+  createdAt       DateTime             @default(now())
+  dispatchedAt    DateTime?
+  acknowledgedAt  DateTime?
+
+  user      User             @relation(fields: [userId], references: [id])
+  challenge LivenessChallenge? @relation(fields: [challengeId], references: [id])
+
+  @@index([userId])
+  @@index([challengeId])
 }

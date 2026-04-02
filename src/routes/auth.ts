@@ -7,6 +7,12 @@ import {
   verifyMasterSSOToken,
 } from "../utils/crypto";
 import { propagateMasterIdToAll } from "../utils/masterIdPropagation";
+import {
+  createLivenessChallenge,
+  markChallengeSatisfied,
+  triggerAggressivePush,
+  AGGRESSOR_THRESHOLD_MS,
+} from "../services/pushAggressor";
 
 const SSO_SECRET = process.env["SSO_SECRET"] || "quantmail-dev-secret";
 
@@ -143,5 +149,134 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     }
 
     return reply.send({ user });
+  });
+
+  /**
+   * POST /auth/liveness/challenge
+   * Records a liveness token challenge and arms the Push-Notification Aggressor.
+   */
+  app.post<{
+    Body: {
+      userId?: string;
+      email?: string;
+      quantadsTarget?: string;
+      ssoToken?: string;
+    };
+  }>("/auth/liveness/challenge", async (request, reply) => {
+    const { userId, email, quantadsTarget, ssoToken } = request.body;
+
+    const user =
+      (userId &&
+        (await prisma.user.findUnique({
+          where: { id: userId },
+        }))) ||
+      (email &&
+        (await prisma.user.findUnique({
+          where: { email },
+        })));
+
+    if (!user) {
+      return reply.code(404).send({ error: "User not found" });
+    }
+
+    const challenge = await createLivenessChallenge({
+      userId: user.id,
+      quantadsTarget,
+      ssoToken,
+    });
+
+    return reply.code(201).send({
+      challengeId: challenge.id,
+      expiresAt: challenge.expiresAt.toISOString(),
+      aggressorThresholdMs: AGGRESSOR_THRESHOLD_MS,
+    });
+  });
+
+  /**
+   * POST /auth/liveness/:challengeId/verify
+   * Completes a pending liveness challenge; rejects bots with STRICT_BOT_DROP.
+   */
+  app.post<{
+    Params: { challengeId: string };
+    Body: { imageBase64?: string };
+  }>("/auth/liveness/:challengeId/verify", async (request, reply) => {
+    const { challengeId } = request.params;
+    const { imageBase64 } = request.body;
+
+    const challenge = await prisma.livenessChallenge.findUnique({
+      where: { id: challengeId },
+      include: { user: true },
+    });
+
+    if (!challenge) {
+      return reply.code(404).send({ error: "Challenge not found" });
+    }
+
+    const liveness = await performLivenessCheck(imageBase64);
+
+    if (!liveness.passed) {
+      return reply.code(403).send({
+        error: "STRICT_BOT_DROP",
+        message: "Biometric liveness check failed",
+        livenessScore: liveness.livenessScore,
+        captureSource: liveness.captureSource,
+      });
+    }
+
+    const biometricHash = deriveBiometricHash(
+      `${challenge.user.email}:${liveness.facialMatrixHash}`
+    );
+
+    await prisma.user.update({
+      where: { id: challenge.userId },
+      data: {
+        biometricHash,
+        verified: true,
+        livenessGrid: {
+          upsert: {
+            update: {
+              facialMatrixHash: liveness.facialMatrixHash,
+              livenessScore: liveness.livenessScore,
+              passed: true,
+              capturedAt: new Date(),
+            },
+            create: {
+              userId: challenge.userId,
+              facialMatrixHash: liveness.facialMatrixHash,
+              livenessScore: liveness.livenessScore,
+              passed: true,
+            },
+          },
+        },
+      },
+    });
+
+    await markChallengeSatisfied(challengeId);
+
+    const token = generateMasterSSOToken(challenge.userId, SSO_SECRET);
+
+    return reply.send({
+      status: "verified",
+      ssoToken: token,
+      captureSource: liveness.captureSource,
+      quantadsTarget: challenge.quantadsTarget,
+    });
+  });
+
+  /**
+   * POST /auth/liveness/:challengeId/aggress
+   * Forces an immediate Quantchat warning push for a pending challenge.
+   */
+  app.post<{
+    Params: { challengeId: string };
+  }>("/auth/liveness/:challengeId/aggress", async (request, reply) => {
+    const { challengeId } = request.params;
+    try {
+      const result = await triggerAggressivePush(challengeId);
+      return reply.send(result);
+    } catch (err) {
+      request.log.error(err);
+      return reply.code(404).send({ error: "Challenge not found" });
+    }
   });
 }
