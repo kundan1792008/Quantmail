@@ -19,6 +19,10 @@ model User {
   livenessGrid   LivenessGrid?
   digitalTwin    DigitalTwin?
   inboxMessages  InboxMessage[]
+  iotDevices     IotDevice[]
+  criticalAlerts CriticalAlert[]
+  alarmSessions  AlarmSession[]
+  dashboardLogins DashboardPhysicalLogin[]
 }
 
 model LivenessGrid {
@@ -63,4 +67,79 @@ model ShadowInbox {
   domain         String
   reason         String   @default("UNVERIFIED_DOMAIN")
   droppedAt      DateTime @default(now())
+}
+
+enum IotDeviceProtocol {
+  WEB_BLUETOOTH
+  APPLE_WATCH
+  IOT_BRIDGE
+}
+
+enum AlarmState {
+  ACTIVE
+  SILENCED
+}
+
+model IotDevice {
+  id          String            @id @default(uuid())
+  userId      String
+  name        String
+  protocol    IotDeviceProtocol
+  endpointRef String
+  active      Boolean           @default(true)
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  user       User            @relation(fields: [userId], references: [id])
+  dispatches AlarmDispatch[]
+}
+
+model CriticalAlert {
+  id             String   @id @default(uuid())
+  userId         String
+  inboxMessageId String?
+  alertType      String
+  severity       String   @default("CRITICAL")
+  summary        String
+  triggeredAt    DateTime @default(now())
+
+  user         User          @relation(fields: [userId], references: [id])
+  alarmSession AlarmSession?
+}
+
+model AlarmSession {
+  id              String   @id @default(uuid())
+  userId          String
+  criticalAlertId String   @unique
+  state           AlarmState @default(ACTIVE)
+  syncGroup       String
+  activatedAt     DateTime @default(now())
+  silencedAt      DateTime?
+
+  user      User            @relation(fields: [userId], references: [id])
+  alert     CriticalAlert   @relation(fields: [criticalAlertId], references: [id])
+  dispatches AlarmDispatch[]
+}
+
+model AlarmDispatch {
+  id             String   @id @default(uuid())
+  alarmSessionId String
+  deviceId       String
+  status         String   @default("QUEUED")
+  dispatchedAt   DateTime @default(now())
+  commandPayload String
+
+  alarmSession AlarmSession @relation(fields: [alarmSessionId], references: [id])
+  device       IotDevice    @relation(fields: [deviceId], references: [id])
+}
+
+model DashboardPhysicalLogin {
+  id         String   @id @default(uuid())
+  userId     String
+  token      String   @unique
+  verifiedAt DateTime @default(now())
+  expiresAt  DateTime
+  consumedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id])
 }

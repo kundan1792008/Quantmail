@@ -5,6 +5,8 @@ import {
   sanitizeBody,
   type IncomingMessage,
 } from "../interceptors/InboxInterceptor";
+import { detectCriticalAlert } from "../services/criticalAlertService";
+import { triggerSynchronizedAlarmForCriticalAlert } from "../services/iotAlarmService";
 
 export async function inboxRoutes(app: FastifyInstance): Promise<void> {
   /**
@@ -53,7 +55,7 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: "Recipient not found" });
     }
 
-    await prisma.inboxMessage.create({
+    const createdMessage = await prisma.inboxMessage.create({
       data: {
         userId: user.id,
         senderEmail: message.senderEmail,
@@ -62,7 +64,36 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
       },
     });
 
-    return reply.code(201).send({ status: "delivered" });
+    const criticalSignal = detectCriticalAlert(
+      createdMessage.subject,
+      createdMessage.body
+    );
+
+    if (
+      criticalSignal.isCritical &&
+      (criticalSignal.category === "PAYMENT" ||
+        criticalSignal.category === "ECOSYSTEM_TOKEN")
+    ) {
+      const alarm = await triggerSynchronizedAlarmForCriticalAlert({
+        userId: user.id,
+        inboxMessageId: createdMessage.id,
+        alertType: criticalSignal.category,
+        summary: criticalSignal.summary,
+      });
+
+      return reply.code(201).send({
+        status: "delivered",
+        criticalAlert: {
+          triggered: true,
+          category: criticalSignal.category,
+          alarmSessionId: alarm.alarmSessionId,
+          syncGroup: alarm.syncGroup,
+          dispatchedDevices: alarm.dispatchedCount,
+        },
+      });
+    }
+
+    return reply.code(201).send({ status: "delivered", criticalAlert: { triggered: false } });
   });
 
   /**
