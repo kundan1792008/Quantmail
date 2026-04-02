@@ -19,6 +19,9 @@ model User {
   livenessGrid   LivenessGrid?
   digitalTwin    DigitalTwin?
   inboxMessages  InboxMessage[]
+  iotDevices     IoTDevice[]
+  alarmSessions  AlarmSession[]
+  loginSessions  PhysicalLoginSession[]
 }
 
 model LivenessGrid {
@@ -52,6 +55,7 @@ model InboxMessage {
   receivedAt  DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id])
+  alarmSession AlarmSession?
 }
 
 model ShadowInbox {
@@ -63,4 +67,94 @@ model ShadowInbox {
   domain         String
   reason         String   @default("UNVERIFIED_DOMAIN")
   droppedAt      DateTime @default(now())
+}
+
+model IoTDevice {
+  id                String      @id @default(uuid())
+  userId            String
+  deviceName        String
+  deviceType        IoTDeviceType
+  deviceFingerprint String      @unique
+  platform          String
+  alarmCapable      Boolean     @default(true)
+  isConnected       Boolean     @default(true)
+  lastSeenAt        DateTime    @default(now())
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  user       User                @relation(fields: [userId], references: [id])
+  dispatches AlarmDeviceDispatch[]
+
+  @@index([userId, isConnected])
+}
+
+model AlarmSession {
+  id                String          @id @default(uuid())
+  userId            String
+  messageId         String?         @unique
+  status            AlarmStatus     @default(ACTIVE)
+  category          AlarmCategory
+  reason            String
+  alarmPayload      String          @default("{}")
+  triggeredAt       DateTime        @default(now())
+  silencedAt        DateTime?
+  silencedBySession String?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  user       User                  @relation(fields: [userId], references: [id])
+  message    InboxMessage?         @relation(fields: [messageId], references: [id])
+  dispatches  AlarmDeviceDispatch[]
+
+  @@index([userId, status, triggeredAt])
+}
+
+model AlarmDeviceDispatch {
+  id              String         @id @default(uuid())
+  alarmSessionId  String
+  iotDeviceId     String
+  dispatchStatus  DispatchStatus @default(PENDING)
+  commandPayload  String
+  dispatchedAt    DateTime       @default(now())
+  acknowledgedAt  DateTime?
+
+  alarmSession AlarmSession @relation(fields: [alarmSessionId], references: [id])
+  iotDevice    IoTDevice    @relation(fields: [iotDeviceId], references: [id])
+
+  @@unique([alarmSessionId, iotDeviceId])
+  @@index([iotDeviceId, dispatchStatus])
+}
+
+model PhysicalLoginSession {
+  id           String   @id @default(uuid())
+  userId       String
+  source       String   @default("QUANTCHAT_DASHBOARD_PHYSICAL")
+  usedForAlarm Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  expiresAt    DateTime
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, expiresAt, usedForAlarm])
+}
+
+enum IoTDeviceType {
+  APPLE_WATCH
+  IOT_WEBBLUETOOTH
+  CAPACITOR_NATIVE
+}
+
+enum AlarmStatus {
+  ACTIVE
+  SILENCED
+}
+
+enum AlarmCategory {
+  CRITICAL_PAYMENT
+  ECOSYSTEM_TOKEN
+}
+
+enum DispatchStatus {
+  PENDING
+  ACKNOWLEDGED
 }
