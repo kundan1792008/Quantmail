@@ -6,11 +6,19 @@ import {
   type IncomingMessage,
 } from "../interceptors/InboxInterceptor";
 import {
-  detectCriticalAlert,
   triggerSynchronizedAlarm,
 } from "../services/criticalAlertAlarmService";
+import { detectCriticalAlert } from "../utils/criticalAlertDetection";
+import { AlarmCategory } from "../generated/prisma/client";
 
 export async function inboxRoutes(app: FastifyInstance): Promise<void> {
+  function mapCriticalCategoryToAlarmCategory(
+    category: "CRITICAL_PAYMENT" | "ECOSYSTEM_TOKEN"
+  ): AlarmCategory {
+    if (category === "CRITICAL_PAYMENT") return AlarmCategory.CRITICAL_PAYMENT;
+    return AlarmCategory.ECOSYSTEM_TOKEN;
+  }
+
   /**
    * POST /inbox/receive
    * Webhook handler for incoming email.
@@ -75,7 +83,7 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
       const alarm = await triggerSynchronizedAlarm({
         userId: user.id,
         messageId: storedMessage.id,
-        category: critical.category,
+        category: mapCriticalCategoryToAlarmCategory(critical.category),
         reason: critical.reason,
       });
 

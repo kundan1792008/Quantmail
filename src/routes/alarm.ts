@@ -1,10 +1,39 @@
-import { FastifyInstance } from "fastify";
+import { FastifyInstance, preHandlerHookHandler } from "fastify";
 import { prisma } from "../db";
 import {
   createPhysicalLoginSession,
   silenceAlarmWithPhysicalLogin,
 } from "../services/criticalAlertAlarmService";
-import { DispatchStatus, IoTDeviceType } from "../generated/prisma/client";
+import {
+  DispatchStatus,
+  IoTDeviceType,
+  type AlarmDeviceDispatch,
+  type IoTDevice,
+} from "../generated/prisma/client";
+
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX = 20;
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(ip, {
+      count: 1,
+      resetAt: now + RATE_LIMIT_WINDOW_MS,
+    });
+    return true;
+  }
+  entry.count += 1;
+  return entry.count <= RATE_LIMIT_MAX;
+}
+
+const rateLimitPreHandler: preHandlerHookHandler = async (request, reply) => {
+  if (!checkRateLimit(request.ip)) {
+    await reply.code(429).send({ error: "Rate limit exceeded" });
+  }
+};
 
 export async function alarmRoutes(app: FastifyInstance): Promise<void> {
   /**
@@ -88,7 +117,8 @@ export async function alarmRoutes(app: FastifyInstance): Promise<void> {
       category: alarm.category,
       triggeredAt: alarm.triggeredAt,
       silencedAt: alarm.silencedAt,
-      dispatches: alarm.dispatches.map((dispatch) => ({
+      dispatches: alarm.dispatches.map(
+        (dispatch: AlarmDeviceDispatch & { iotDevice: IoTDevice }) => ({
         dispatchId: dispatch.id,
         deviceId: dispatch.iotDeviceId,
         deviceName: dispatch.iotDevice.deviceName,
@@ -96,7 +126,8 @@ export async function alarmRoutes(app: FastifyInstance): Promise<void> {
         dispatchStatus: dispatch.dispatchStatus,
         commandPayload: dispatch.commandPayload,
         acknowledgedAt: dispatch.acknowledgedAt,
-      })),
+        })
+      ),
     });
   });
 
@@ -150,25 +181,33 @@ export async function alarmRoutes(app: FastifyInstance): Promise<void> {
    */
   app.post<{
     Body: { userId: string };
-  }>("/quantchat/dashboard/physical-login", async (request, reply) => {
-    const { userId } = request.body;
-    if (!userId) {
-      return reply.code(400).send({ error: "userId required" });
-    }
+  }>(
+    "/quantchat/dashboard/physical-login",
+    { preHandler: rateLimitPreHandler },
+    async (request, reply) => {
+      if (!checkRateLimit(request.ip)) {
+        return reply.code(429).send({ error: "Rate limit exceeded" });
+      }
 
-    const user = await prisma.user.findUnique({ where: { id: userId } });
-    if (!user) {
-      return reply.code(404).send({ error: "User not found" });
-    }
+      const { userId } = request.body;
+      if (!userId) {
+        return reply.code(400).send({ error: "userId required" });
+      }
 
-    const session = await createPhysicalLoginSession(userId);
-    return reply.code(201).send({
-      status: "physical_login_verified",
-      physicalSessionId: session.sessionId,
-      expiresAt: session.expiresAt,
-      source: "QUANTCHAT_DASHBOARD_PHYSICAL",
-    });
-  });
+      const user = await prisma.user.findUnique({ where: { id: userId } });
+      if (!user) {
+        return reply.code(404).send({ error: "User not found" });
+      }
+
+      const session = await createPhysicalLoginSession(userId);
+      return reply.code(201).send({
+        status: "physical_login_verified",
+        physicalSessionId: session.sessionId,
+        expiresAt: session.expiresAt,
+        source: "QUANTCHAT_DASHBOARD_PHYSICAL",
+      });
+    }
+  );
 
   /**
    * POST /alarm/:alarmSessionId/silence
@@ -177,34 +216,42 @@ export async function alarmRoutes(app: FastifyInstance): Promise<void> {
   app.post<{
     Params: { alarmSessionId: string };
     Body: { userId: string; physicalSessionId: string };
-  }>("/alarm/:alarmSessionId/silence", async (request, reply) => {
-    const { alarmSessionId } = request.params;
-    const { userId, physicalSessionId } = request.body;
+  }>(
+    "/alarm/:alarmSessionId/silence",
+    { preHandler: rateLimitPreHandler },
+    async (request, reply) => {
+      if (!checkRateLimit(request.ip)) {
+        return reply.code(429).send({ error: "Rate limit exceeded" });
+      }
 
-    if (!userId || !physicalSessionId) {
-      return reply
-        .code(400)
-        .send({ error: "userId and physicalSessionId required" });
-    }
+      const { alarmSessionId } = request.params;
+      const { userId, physicalSessionId } = request.body;
 
-    const outcome = await silenceAlarmWithPhysicalLogin({
-      alarmSessionId,
-      userId,
-      physicalSessionId,
-    });
+      if (!userId || !physicalSessionId) {
+        return reply
+          .code(400)
+          .send({ error: "userId and physicalSessionId required" });
+      }
 
-    if (!outcome.silenced) {
-      return reply.code(403).send({
-        error: "ALARM_SILENCE_REJECTED",
+      const outcome = await silenceAlarmWithPhysicalLogin({
+        alarmSessionId,
+        userId,
+        physicalSessionId,
+      });
+
+      if (!outcome.silenced) {
+        return reply.code(403).send({
+          error: "ALARM_SILENCE_REJECTED",
+          reason: outcome.reason,
+          policy: "ONLY_QUANTCHAT_PHYSICAL_DASHBOARD_LOGIN",
+        });
+      }
+
+      return reply.send({
+        status: "alarm_silenced",
         reason: outcome.reason,
         policy: "ONLY_QUANTCHAT_PHYSICAL_DASHBOARD_LOGIN",
       });
     }
-
-    return reply.send({
-      status: "alarm_silenced",
-      reason: outcome.reason,
-      policy: "ONLY_QUANTCHAT_PHYSICAL_DASHBOARD_LOGIN",
-    });
-  });
+  );
 }

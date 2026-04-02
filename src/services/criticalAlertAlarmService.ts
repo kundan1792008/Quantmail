@@ -1,50 +1,6 @@
 import { prisma } from "../db";
 import { AlarmCategory, DispatchStatus, IoTDeviceType } from "../generated/prisma/client";
 
-export interface CriticalAlertDetectionResult {
-  isCritical: boolean;
-  category: AlarmCategory | null;
-  reason: string;
-}
-
-const PAYMENT_PATTERNS: readonly RegExp[] = [
-  /\b(payment|payout|wire|settlement|invoice|chargeback)\b/i,
-  /\b(fraud|unauthorized|failed payment|declined)\b/i,
-  /\b(urgent transfer|wallet drained)\b/i,
-];
-
-const TOKEN_PATTERNS: readonly RegExp[] = [
-  /\b(token|ecosystem token|staking|unstake|mint|burn)\b/i,
-  /\b(private key|seed phrase|wallet breach)\b/i,
-  /\b(liquidity|bridge exploit|governance attack)\b/i,
-];
-
-export function detectCriticalAlert(subject: string, body: string): CriticalAlertDetectionResult {
-  const content = `${subject}\n${body}`;
-
-  if (PAYMENT_PATTERNS.some((pattern) => pattern.test(content))) {
-    return {
-      isCritical: true,
-      category: AlarmCategory.CRITICAL_PAYMENT,
-      reason: "CRITICAL_PAYMENT_ALERT",
-    };
-  }
-
-  if (TOKEN_PATTERNS.some((pattern) => pattern.test(content))) {
-    return {
-      isCritical: true,
-      category: AlarmCategory.ECOSYSTEM_TOKEN,
-      reason: "ECOSYSTEM_TOKEN_ALERT",
-    };
-  }
-
-  return {
-    isCritical: false,
-    category: null,
-    reason: "NON_CRITICAL",
-  };
-}
-
 function buildDispatchPayload(alarmSessionId: string, deviceType: IoTDeviceType): string {
   return JSON.stringify({
     protocol: "quantmail-webbluetooth-sync-v1",
@@ -84,31 +40,23 @@ export async function triggerSynchronizedAlarm(params: {
         mode: "SYNCHRONIZED_WEBBLUETOOTH",
         origin: "INBOX_CRITICAL_ALERT",
       }),
-      dispatches: {
-        create: connectedDevices.map((device) => ({
-          iotDeviceId: device.id,
-          commandPayload: buildDispatchPayload("", device.deviceType),
-          dispatchStatus: DispatchStatus.PENDING,
-        })),
-      },
     },
-    include: { dispatches: true },
   });
 
-  await Promise.all(
-    alarmSession.dispatches.map((dispatch) =>
-      prisma.alarmDeviceDispatch.update({
-        where: { id: dispatch.id },
-        data: {
-          commandPayload: buildDispatchPayload(alarmSession.id, connectedDevices.find((d) => d.id === dispatch.iotDeviceId)?.deviceType || IoTDeviceType.IOT_WEBBLUETOOTH),
-        },
+  await prisma.alarmDeviceDispatch.createMany({
+    data: connectedDevices.map(
+      (device: { id: string; deviceType: IoTDeviceType }) => ({
+        alarmSessionId: alarmSession.id,
+        iotDeviceId: device.id,
+        commandPayload: buildDispatchPayload(alarmSession.id, device.deviceType),
+        dispatchStatus: DispatchStatus.PENDING,
       })
-    )
-  );
+    ),
+  });
 
   return {
     alarmSessionId: alarmSession.id,
-    dispatchedDevices: alarmSession.dispatches.length,
+    dispatchedDevices: connectedDevices.length,
     silencingPolicy: "ONLY_QUANTCHAT_PHYSICAL_DASHBOARD_LOGIN",
   };
 }
@@ -165,7 +113,7 @@ export async function silenceAlarmWithPhysicalLogin(params: {
         silencedBySession: session.id,
       },
     }),
-    ...alarm.dispatches.map((dispatch) =>
+    ...alarm.dispatches.map((dispatch: { id: string }) =>
       prisma.alarmDeviceDispatch.update({
         where: { id: dispatch.id },
         data: {

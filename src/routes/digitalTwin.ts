@@ -1,5 +1,6 @@
 import { FastifyInstance } from "fastify";
 import { prisma } from "../db";
+import type { InboxMessage } from "../generated/prisma/client";
 
 export async function digitalTwinRoutes(app: FastifyInstance): Promise<void> {
   /**
@@ -30,7 +31,7 @@ export async function digitalTwinRoutes(app: FastifyInstance): Promise<void> {
       userId: user.id,
       displayName: user.displayName,
       totalMessages: messages.length,
-      recentSubjects: messages.map((m) => ({
+      recentSubjects: messages.map((m: InboxMessage) => ({
         id: m.id,
         subject: m.subject,
         from: m.senderEmail,
