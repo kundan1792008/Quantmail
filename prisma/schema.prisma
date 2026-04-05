@@ -29,6 +29,8 @@ model User {
   livenessChallenges        LivenessChallenge[]
   pushNotifications         PushNotification[]
   quanttubeWatchEvents      QuanttubeWatchEvent[]
+  calendarEvents            CalendarEvent[]
+  docs                      Doc[]
 }
 
 model LivenessGrid {
@@ -257,4 +259,35 @@ model QuanttubeWatchEvent {
   watchedAt      DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id])
+}
+
+// ─── AI Orchestrator: Inter-App Communication ────────────────────
+
+model CalendarEvent {
+  id              String    @id @default(uuid())
+  userId          String
+  title           String
+  description     String    @default("")
+  startTime       DateTime
+  endTime         DateTime?
+  sourceMessageId String?
+  createdAt       DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
+
+model Doc {
+  id         String   @id @default(uuid())
+  userId     String
+  title      String
+  content    String
+  sourceType String   @default("manual")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
 }
