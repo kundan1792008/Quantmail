@@ -7,6 +7,8 @@ import { iotRoutes } from "./routes/iot";
 import { quanteditsRoutes } from "./routes/quantedits";
 import { pushRoutes } from "./routes/push";
 import { quanttubeRoutes } from "./routes/quanttube";
+import { adminRoutes } from "./routes/admin";
+import { webhookRoutes } from "./routes/webhook";
 
 const app = Fastify({ logger: true });
 
@@ -19,6 +21,8 @@ async function main(): Promise<void> {
   await app.register(quanteditsRoutes);
   await app.register(pushRoutes);
   await app.register(quanttubeRoutes);
+  await app.register(adminRoutes);
+  await app.register(webhookRoutes);
 
   app.get("/health", async () => ({ status: "ok", service: "quantmail" }));
 

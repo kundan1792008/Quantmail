@@ -7,7 +7,7 @@ export default defineConfig({
   migrate: {
     async datasource() {
       return {
-        url: "file:./dev.db",
+        url: "file:./prisma/dev.db",
       };
     },
   },

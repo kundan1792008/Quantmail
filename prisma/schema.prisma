@@ -9,12 +9,18 @@ datasource db {
 
 // ─── Core Identity ───────────────────────────────────────────────
 
+enum UserRole {
+  USER
+  ADMIN
+}
+
 model User {
   id             String         @id @default(uuid())
   displayName    String
   email          String         @unique
   biometricHash  String         @unique
   verified       Boolean        @default(false)
+  role           UserRole       @default(USER)
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
 
@@ -257,4 +263,16 @@ model QuanttubeWatchEvent {
   watchedAt      DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id])
+}
+
+// ─── Webhook Subscriptions ────────────────────────────────────────
+
+model WebhookEndpoint {
+  id        String   @id @default(uuid())
+  url       String
+  secret    String
+  events    String   @default("[]")
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
