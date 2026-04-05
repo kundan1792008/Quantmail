@@ -12,7 +12,7 @@ export default function Home() {
       {!authenticated ? (
         <BiometricLogin onSuccess={() => setAuthenticated(true)} />
       ) : (
-        <InboxDashboard />
+        <InboxDashboard onSignOut={() => setAuthenticated(false)} />
       )}
     </main>
   )
