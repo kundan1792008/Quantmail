@@ -9,12 +9,19 @@ datasource db {
 
 // ─── Core Identity ───────────────────────────────────────────────
 
+enum UserRole {
+  FREE
+  PRO
+}
+
 model User {
   id             String         @id @default(uuid())
   displayName    String
   email          String         @unique
   biometricHash  String         @unique
   verified       Boolean        @default(false)
+  role           UserRole       @default(FREE)
+  aiCount        Int            @default(0)
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
 
@@ -29,6 +36,13 @@ model User {
   livenessChallenges        LivenessChallenge[]
   pushNotifications         PushNotification[]
   quanttubeWatchEvents      QuanttubeWatchEvent[]
+  tasks                     Task[]
+  chatMessages              ChatMessage[]
+  notes                     Note[]
+  calendarEvents            CalendarEvent[]
+  docs                      Doc[]
+  sheets                    Sheet[]
+  driveFiles                DriveFile[]
 }
 
 model LivenessGrid {
@@ -255,6 +269,107 @@ model QuanttubeWatchEvent {
   videoTitle     String
   watchedSeconds Int
   watchedAt      DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+// ─── 9-App Workspace Models ───────────────────────────────────────
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  DONE
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+model Task {
+  id          String       @id @default(uuid())
+  userId      String
+  title       String
+  description String       @default("")
+  status      TaskStatus   @default(TODO)
+  priority    TaskPriority @default(MEDIUM)
+  dueDate     DateTime?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model ChatMessage {
+  id        String   @id @default(uuid())
+  userId    String
+  channel   String   @default("general")
+  content   String
+  sentAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model Note {
+  id        String   @id @default(uuid())
+  userId    String
+  title     String
+  content   String   @default("")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model CalendarEvent {
+  id          String   @id @default(uuid())
+  userId      String
+  title       String
+  description String   @default("")
+  startAt     DateTime
+  endAt       DateTime
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model Doc {
+  id          String   @id @default(uuid())
+  userId      String
+  title       String
+  content     String   @default("")
+  shareToken  String?  @unique
+  isPublic    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model Sheet {
+  id         String   @id @default(uuid())
+  userId     String
+  title      String
+  data       String   @default("[]")
+  shareToken String?  @unique
+  isPublic   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model DriveFile {
+  id        String   @id @default(uuid())
+  userId    String
+  name      String
+  mimeType  String
+  size      Int      @default(0)
+  url       String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id])
 }
