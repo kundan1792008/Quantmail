@@ -37,6 +37,7 @@ export async function smartReplyRoutes(app: FastifyInstance): Promise<void> {
     try {
       const result = await generateSmartReply({
         emailContext: emailContext.trim(),
+        // tone is optional; blank or whitespace falls back to "Professional" intentionally.
         tone: tone?.trim() || "Professional",
       });
 
