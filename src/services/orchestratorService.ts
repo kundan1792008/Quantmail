@@ -106,7 +106,7 @@ async function meetToDoc(
 ): Promise<OrchestratorResult> {
   const transcript = typeof payload["transcript"] === "string" ? payload["transcript"] : "";
   const meetingTitle = typeof payload["meetingTitle"] === "string" ? payload["meetingTitle"] : "Meeting Transcript";
-  const date = new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
+  const date = new Date().toISOString().slice(0, 10);
 
   const content = `# ${meetingTitle}\n\n**Date:** ${date}\n\n## Transcript\n\n${transcript}`;
 
@@ -148,7 +148,8 @@ async function noteToCalendar(
   }
 
   const startAt = new Date(startAtRaw);
-  const endAt = endAtRaw ? new Date(endAtRaw) : new Date(startAt.getTime() + 60 * 60 * 1000);
+  const DEFAULT_EVENT_DURATION_MS = 60 * 60 * 1000; // 1 hour
+  const endAt = endAtRaw ? new Date(endAtRaw) : new Date(startAt.getTime() + DEFAULT_EVENT_DURATION_MS);
 
   if (isNaN(startAt.getTime())) {
     return { success: false, sourceApp, targetApp, action, error: "Invalid startAt date" };
