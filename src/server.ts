@@ -27,6 +27,7 @@ import { adminRoutes } from "./routes/admin";
 import { webhookRoutes } from "./routes/webhook";
 import { prisma } from "./db";
 import { landingPage } from "./landing";
+import { superAppRoutes } from "./routes/superapp";
 
 function buildHttpsOptions(): { key: string; cert: string; ca?: string } | undefined {
   const keyPath = process.env["TLS_KEY_PATH"];
@@ -122,6 +123,7 @@ async function main(): Promise<void> {
   await app.register(settingsRoutes);
   await app.register(adminRoutes);
   await app.register(webhookRoutes);
+  await app.register(superAppRoutes);
 
   app.get(
     "/health",
