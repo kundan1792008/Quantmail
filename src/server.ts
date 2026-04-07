@@ -25,10 +25,10 @@ import { meetRoutes } from "./routes/meet";
 import { settingsRoutes } from "./routes/settings";
 import { adminRoutes } from "./routes/admin";
 import { webhookRoutes } from "./routes/webhook";
-import { prisma } from "./db";
-import { landingPage } from "./landing";
 import { superAppRoutes } from "./routes/superapp";
 import { smartReplyRoutes } from "./routes/smartReply";
+import { prisma } from "./db";
+import { landingPage } from "./landing";
 
 function buildHttpsOptions(): { key: string; cert: string; ca?: string } | undefined {
   const keyPath = process.env["TLS_KEY_PATH"];
@@ -88,9 +88,7 @@ async function main(): Promise<void> {
         description: "Quantmail – Biometric Identity Gateway REST API",
         version: "1.0.0",
       },
-      servers: [
-        { url: "http://localhost:3000", description: "Local development" },
-      ],
+      servers: [{ url: "http://localhost:3000", description: "Local development" }],
       components: {
         securitySchemes: {
           bearerAuth: { type: "http", scheme: "bearer", bearerFormat: "JWT" },
@@ -111,7 +109,6 @@ async function main(): Promise<void> {
   await app.register(quanteditsRoutes);
   await app.register(pushRoutes);
   await app.register(quanttubeRoutes);
-<<<<<<< HEAD
   await app.register(orchestratorRoutes);
   await app.register(tasksRoutes);
   await app.register(chatRoutes);
@@ -127,9 +124,6 @@ async function main(): Promise<void> {
   await app.register(webhookRoutes);
   await app.register(superAppRoutes);
   await app.register(smartReplyRoutes);
-=======
-  await app.register(driveRoutes);
->>>>>>> origin/copilot/add-file-explorer-ui-and-upload-functionality
 
   app.get(
     "/health",
