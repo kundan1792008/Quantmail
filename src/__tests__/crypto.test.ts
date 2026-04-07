@@ -3,6 +3,8 @@ import {
   deriveBiometricHash,
   generateMasterSSOToken,
   verifyMasterSSOToken,
+  hashSecret,
+  verifySecret,
 } from "../utils/crypto";
 
 describe("deriveBiometricHash", () => {
@@ -59,5 +61,35 @@ describe("Master SSO Token", () => {
     expect(verifyMasterSSOToken("", secret)).toBeNull();
     expect(verifyMasterSSOToken("single-part", secret)).toBeNull();
     expect(verifyMasterSSOToken("a.b.c", secret)).toBeNull();
+  });
+});
+
+describe("Argon2 key derivation", () => {
+  it("hashSecret should produce a string starting with $argon2id$", async () => {
+    const hash = await hashSecret("super-secret");
+    expect(hash).toMatch(/^\$argon2id\$/);
+  });
+
+  it("verifySecret should return true for a matching secret", async () => {
+    const hash = await hashSecret("my-password");
+    const result = await verifySecret(hash, "my-password");
+    expect(result).toBe(true);
+  });
+
+  it("verifySecret should return false for a wrong secret", async () => {
+    const hash = await hashSecret("correct-password");
+    const result = await verifySecret(hash, "wrong-password");
+    expect(result).toBe(false);
+  });
+
+  it("verifySecret should return false for a garbage hash", async () => {
+    const result = await verifySecret("not-a-hash", "anything");
+    expect(result).toBe(false);
+  });
+
+  it("hashSecret should produce different hashes for the same input (salted)", async () => {
+    const a = await hashSecret("same-input");
+    const b = await hashSecret("same-input");
+    expect(a).not.toBe(b);
   });
 });

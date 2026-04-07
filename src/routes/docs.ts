@@ -1,12 +1,8 @@
+import { randomUUID } from "crypto";
 import { FastifyInstance } from "fastify";
 import { prisma } from "../db";
-import { randomUUID } from "crypto";
 
 export async function docsRoutes(app: FastifyInstance): Promise<void> {
-  /**
-   * GET /docs/:userId
-   * Returns all docs for a user.
-   */
   app.get<{ Params: { userId: string } }>("/docs/:userId", async (request, reply) => {
     const { userId } = request.params;
     const docs = await prisma.doc.findMany({
@@ -16,10 +12,15 @@ export async function docsRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ docs });
   });
 
-  /**
-   * POST /docs
-   * Creates a new doc.
-   */
+  app.get<{ Params: { userId: string; id: string } }>("/docs/:userId/:id", async (request, reply) => {
+    const { userId, id } = request.params;
+    const doc = await prisma.doc.findFirst({ where: { id, userId } });
+    if (!doc) {
+      return reply.code(404).send({ error: "Doc not found" });
+    }
+    return reply.send({ doc });
+  });
+
   app.post<{
     Body: { userId: string; title: string; content?: string };
   }>("/docs", async (request, reply) => {
@@ -33,18 +34,16 @@ export async function docsRoutes(app: FastifyInstance): Promise<void> {
     return reply.code(201).send({ doc });
   });
 
-  /**
-   * PUT /docs/:id
-   * Updates a doc.
-   */
   app.put<{
     Params: { id: string };
-    Body: { title?: string; content?: string };
+    Body: { userId?: string; title?: string; content?: string };
   }>("/docs/:id", async (request, reply) => {
     const { id } = request.params;
-    const { title, content } = request.body;
+    const { userId, title, content } = request.body;
 
-    const existing = await prisma.doc.findUnique({ where: { id } });
+    const existing = userId
+      ? await prisma.doc.findFirst({ where: { id, userId } })
+      : await prisma.doc.findUnique({ where: { id } });
     if (!existing) {
       return reply.code(404).send({ error: "Doc not found" });
     }
@@ -60,26 +59,21 @@ export async function docsRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ doc });
   });
 
-  /**
-   * DELETE /docs/:id
-   * Deletes a doc.
-   */
-  app.delete<{ Params: { id: string } }>("/docs/:id", async (request, reply) => {
+  app.delete<{ Params: { id: string }; Body: { userId?: string } }>("/docs/:id", async (request, reply) => {
     const { id } = request.params;
+    const userId = request.body?.userId;
 
-    const existing = await prisma.doc.findUnique({ where: { id } });
+    const existing = userId
+      ? await prisma.doc.findFirst({ where: { id, userId } })
+      : await prisma.doc.findUnique({ where: { id } });
     if (!existing) {
       return reply.code(404).send({ error: "Doc not found" });
     }
 
     await prisma.doc.delete({ where: { id } });
-    return reply.code(204).send();
+    return reply.send({ status: "deleted" });
   });
 
-  /**
-   * POST /docs/:id/share
-   * Generates a public share token for a doc.
-   */
   app.post<{ Params: { id: string } }>("/docs/:id/share", async (request, reply) => {
     const { id } = request.params;
 
@@ -89,7 +83,6 @@ export async function docsRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const shareToken = randomUUID();
-
     const doc = await prisma.doc.update({
       where: { id },
       data: { isPublic: true, shareToken },
@@ -98,10 +91,6 @@ export async function docsRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ shareToken: doc.shareToken, shareUrl: `/docs/share/${doc.shareToken}` });
   });
 
-  /**
-   * GET /docs/share/:shareToken
-   * Returns a read-only public view of a shared doc.
-   */
   app.get<{ Params: { shareToken: string } }>("/docs/share/:shareToken", async (request, reply) => {
     const { shareToken } = request.params;
 
