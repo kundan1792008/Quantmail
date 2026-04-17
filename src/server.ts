@@ -28,6 +28,7 @@ import { adminRoutes } from "./routes/admin";
 import { webhookRoutes } from "./routes/webhook";
 import { superAppRoutes } from "./routes/superapp";
 import { smartReplyRoutes } from "./routes/smartReply";
+import { smartComposeRoutes } from "./routes/smartCompose";
 import { tokenValidatorRoutes } from "./services/TokenValidator";
 import { prisma } from "./db";
 import { landingPage } from "./landing";
@@ -126,6 +127,7 @@ async function main(): Promise<void> {
   await app.register(webhookRoutes);
   await app.register(superAppRoutes);
   await app.register(smartReplyRoutes);
+  await app.register(smartComposeRoutes);
   await app.register(tokenValidatorRoutes);
   await app.register(profileRoutes);
 

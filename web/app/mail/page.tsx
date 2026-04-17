@@ -2,6 +2,7 @@
 
 import { motion } from "framer-motion";
 import { useState } from "react";
+import SmartComposeUI from "../components/SmartComposeUI";
 
 const mockEmails = [
   {
@@ -64,6 +65,8 @@ const mockEmails = [
 export default function MailPage() {
   const [selected, setSelected] = useState(mockEmails[0]);
   const [composing, setComposing] = useState(false);
+  const [composeTo, setComposeTo] = useState("");
+  const [composeSubject, setComposeSubject] = useState("");
 
   return (
     <motion.div
@@ -166,12 +169,30 @@ export default function MailPage() {
               <button onClick={() => setComposing(false)} style={{ color: "#6b7280" }}>✕</button>
             </div>
             <div className="flex flex-col gap-3 flex-1 rounded-2xl p-4" style={{ background: "#111", border: "1px solid rgba(255,255,255,0.06)" }}>
-              <input placeholder="To" className="bg-transparent outline-none text-sm py-2" style={{ color: "#f0f0f0", borderBottom: "1px solid rgba(255,255,255,0.06)" }} />
-              <input placeholder="Subject" className="bg-transparent outline-none text-sm py-2" style={{ color: "#f0f0f0", borderBottom: "1px solid rgba(255,255,255,0.06)" }} />
-              <textarea placeholder="Write your message…" className="flex-1 bg-transparent outline-none text-sm resize-none" style={{ color: "#9ca3af" }} />
+              <input
+                placeholder="To"
+                value={composeTo}
+                onChange={(e) => setComposeTo(e.target.value)}
+                className="bg-transparent outline-none text-sm py-2"
+                style={{ color: "#f0f0f0", borderBottom: "1px solid rgba(255,255,255,0.06)" }}
+              />
+              <input
+                placeholder="Subject"
+                value={composeSubject}
+                onChange={(e) => setComposeSubject(e.target.value)}
+                className="bg-transparent outline-none text-sm py-2"
+                style={{ color: "#f0f0f0", borderBottom: "1px solid rgba(255,255,255,0.06)" }}
+              />
+              <SmartComposeUI
+                subject={composeSubject}
+                recipientEmail={composeTo}
+                recipientName={composeTo.split("@")[0] ?? composeTo}
+                userEmail="me@quantmail.app"
+                placeholder="Write your message…"
+                className="flex-1"
+              />
               <div className="flex items-center justify-between pt-2">
                 <button className="px-4 py-2 rounded-xl text-sm font-medium" style={{ background: "#6366f1", color: "#fff" }}>Send</button>
-                <button className="text-xs px-3 py-2 rounded-lg" style={{ background: "rgba(99,102,241,0.1)", color: "#818cf8" }}>✨ AI Draft</button>
               </div>
             </div>
           </motion.div>
