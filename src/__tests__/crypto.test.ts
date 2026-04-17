@@ -13,7 +13,7 @@ describe("deriveBiometricHash", () => {
     expect(hash).toMatch(/^[a-f0-9]{64}$/);
   });
 
-  it("should produce the same hash for the same input", () => {
+  it("should produce the same hash for the same input (deterministic)", () => {
     const a = deriveBiometricHash("same-input");
     const b = deriveBiometricHash("same-input");
     expect(a).toBe(b);
@@ -23,6 +23,25 @@ describe("deriveBiometricHash", () => {
     const a = deriveBiometricHash("input-a");
     const b = deriveBiometricHash("input-b");
     expect(a).not.toBe(b);
+  });
+
+  it("should produce a different hash when ENCRYPTION_SECRET changes (server-bound)", () => {
+    const original = process.env["ENCRYPTION_SECRET"];
+    let hashA: string;
+    let hashB: string;
+    try {
+      process.env["ENCRYPTION_SECRET"] = "secret-a";
+      hashA = deriveBiometricHash("same-data");
+      process.env["ENCRYPTION_SECRET"] = "secret-b";
+      hashB = deriveBiometricHash("same-data");
+    } finally {
+      if (original !== undefined) {
+        process.env["ENCRYPTION_SECRET"] = original;
+      } else {
+        delete process.env["ENCRYPTION_SECRET"];
+      }
+    }
+    expect(hashA).not.toBe(hashB);
   });
 });
 

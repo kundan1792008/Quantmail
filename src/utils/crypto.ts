@@ -1,6 +1,7 @@
 import {
   createCipheriv,
   createDecipheriv,
+  createHmac,
   randomBytes,
   scryptSync,
 } from "node:crypto";
@@ -8,8 +9,21 @@ import CryptoJS from "crypto-js";
 import { v4 as uuidv4 } from "uuid";
 import argon2 from "argon2";
 
+/**
+ * Derives a server-bound biometric hash using HMAC-SHA256.
+ *
+ * Using a keyed HMAC instead of plain SHA-256 ensures that the stored hash
+ * cannot be verified or reproduced by someone who has only the database dump —
+ * the ENCRYPTION_SECRET (server-side key) is required.  The output is still
+ * deterministic for a given input and key, so it can be used as a unique
+ * database index.
+ */
 export function deriveBiometricHash(facialMatrixData: string): string {
-  return CryptoJS.SHA256(facialMatrixData).toString(CryptoJS.enc.Hex);
+  const hmacSecret =
+    process.env["ENCRYPTION_SECRET"] || "quantmail-key-secret";
+  return createHmac("sha256", hmacSecret)
+    .update(facialMatrixData)
+    .digest("hex");
 }
 
 /** Default token lifetime: 24 hours in milliseconds. */
