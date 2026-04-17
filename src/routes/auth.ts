@@ -70,6 +70,16 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         email,
         biometricHash,
         verified: true,
+        biometricHashes: {
+          create: {
+            hash: biometricHash,
+            verifiedAt: new Date(),
+            metadata: JSON.stringify({
+              source: "fastify_auth_register",
+              captureSource: liveness.captureSource,
+            }),
+          },
+        },
         livenessGrid: {
           create: {
             facialMatrixHash: liveness.facialMatrixHash,
