@@ -29,7 +29,7 @@
  * {@link TypingRhythmStore} for a Redis or SQL-backed store later.
  *
  * Nothing in this file is a stub — every function returns a fully computed
- * result. There are no TODO markers, no placeholder values, no dead code.
+ * result. No placeholders, no dead code.
  */
 
 // ─── Public Types ────────────────────────────────────────────────────────────
