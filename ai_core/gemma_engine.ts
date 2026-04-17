@@ -619,6 +619,15 @@ const DEFAULT_MODEL_URL =
 const DEFAULT_CACHE_NAME = "gemma-model-v1";
 const DEFAULT_MAX_MEMORY_MB = 512;
 
+/** Static threat-class labels used during ML signal generation. */
+const THREAT_CLASSES: ReadonlyArray<{ type: string; description: string }> = [
+  { type: "THREAT_NONE",     description: "No threat detected" },
+  { type: "THREAT_LOW",      description: "Low-level anomaly" },
+  { type: "THREAT_MEDIUM",   description: "Moderate behavioural anomaly" },
+  { type: "THREAT_HIGH",     description: "High-confidence bot or automation" },
+  { type: "THREAT_CRITICAL", description: "Critical synthetic-identity signal" },
+];
+
 /**
  * Main entry point for on-device Gemma AI threat detection.
  *
@@ -761,13 +770,7 @@ export class GemmaEngine {
       // Threat score = complement of the "none" class probability
       mlScore = Math.max(0, 1 - (probabilities[0] ?? 1));
 
-      const classes: Array<{ type: string; description: string }> = [
-        { type: "THREAT_NONE",     description: "No threat detected" },
-        { type: "THREAT_LOW",      description: "Low-level anomaly" },
-        { type: "THREAT_MEDIUM",   description: "Moderate behavioural anomaly" },
-        { type: "THREAT_HIGH",     description: "High-confidence bot or automation" },
-        { type: "THREAT_CRITICAL", description: "Critical synthetic-identity signal" },
-      ];
+      const classes = THREAT_CLASSES;
 
       for (let i = 1; i < Math.min(probabilities.length, classes.length); i++) {
         const confidence = probabilities[i] ?? 0;
