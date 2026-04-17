@@ -45,7 +45,6 @@ model User {
 
   livenessGrid              LivenessGrid?
   digitalTwin               DigitalTwin?
-  webAuthnCredentials       WebAuthnCredential[]
   sessions                  UserSession[]
   inboxMessages             InboxMessage[]
   saccadeSessions           SaccadeSession[]
@@ -71,6 +70,8 @@ model User {
   biometricHashes           BiometricHash[]
   webAuthnChallenges        WebAuthnChallenge[]
   webAuthnCredentials       WebAuthnCredential[]
+  sentEphemeralMessages     EphemeralMessage[]   @relation("SentEphemeralMessages")
+  messageVaultEntries       MessageVaultEntry[]
 }
 
 // ─── AI / BYOK Settings ──────────────────────────────────────────
@@ -136,25 +137,6 @@ model WebAuthnChallenge {
 
   @@index([email, type, createdAt])
   @@index([expiresAt])
-}
-
-model WebAuthnCredential {
-  id             String   @id @default(uuid())
-  userId         String
-  credentialId   String   @unique
-  publicKey      Bytes
-  counter        Int      @default(0)
-  transports     String   @default("[]")
-  deviceType     String   @default("singleDevice")
-  backedUp       Boolean  @default(false)
-  credentialType String   @default("public-key")
-  lastUsedAt     DateTime?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-
-  user User @relation(fields: [userId], references: [id])
-
-  @@index([userId, createdAt])
 }
 
 model DigitalTwin {
@@ -613,4 +595,98 @@ model SecurityAuditLog {
 
   @@index([userId, occurredAt])
   @@index([eventType, occurredAt])
+}
+
+// ─── Ephemeral E2E Messages ───────────────────────────────────────
+
+/**
+ * Destruction modes for self-destructing messages.
+ *
+ * READ_ONCE        — message is destroyed after the first successful read.
+ * TIMER_1H         — message expires 1 hour after creation.
+ * TIMER_24H        — message expires 24 hours after creation.
+ * TIMER_7D         — message expires 7 days after creation.
+ * SCREENSHOT_PROOF — same as READ_ONCE but also applies CSS/JS anti-capture
+ *                    overlays in the SecureReader component.
+ */
+enum DestructionMode {
+  READ_ONCE
+  TIMER_1H
+  TIMER_24H
+  TIMER_7D
+  SCREENSHOT_PROOF
+}
+
+/**
+ * Server-side store for AES-256-GCM encrypted message blobs.
+ *
+ * The actual decryption key is NEVER stored here.  It lives exclusively
+ * in the URL fragment (#key=…) so the server cannot read the content.
+ * After destruction, the blob is overwritten with random bytes before
+ * the row is deleted.
+ */
+model EphemeralMessage {
+  id              String          @id @default(uuid())
+  senderId        String
+  recipientEmail  String
+  encryptedBlob   Bytes
+  iv              String
+  authTag         String
+  subject         String          @default("")
+  destructionMode DestructionMode @default(READ_ONCE)
+  screenshotProof Boolean         @default(false)
+  expiresAt       DateTime?
+  readAt          DateTime?
+  destroyedAt     DateTime?
+  createdAt       DateTime        @default(now())
+
+  sender  User              @relation("SentEphemeralMessages", fields: [senderId], references: [id])
+  keyPair EphemeralKeyPair?
+
+  @@index([recipientEmail])
+  @@index([senderId])
+  @@index([expiresAt])
+}
+
+/**
+ * Per-message ECDH key pair record.
+ *
+ * The server stores only the sender's ephemeral public key so the
+ * recipient can derive the shared secret client-side.  The private key
+ * is generated client-side and never transmitted.
+ *
+ * Revoking a key pair makes all messages encrypted with it unreadable
+ * (the client can no longer perform the ECDH derivation).
+ */
+model EphemeralKeyPair {
+  id               String    @id @default(uuid())
+  messageId        String    @unique
+  senderPublicKey  String
+  recipientPubKey  String?
+  revokedAt        DateTime?
+  createdAt        DateTime  @default(now())
+
+  message EphemeralMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+}
+
+/**
+ * Message Vault — optional long-term storage for ephemeral messages
+ * that the original sender explicitly allows to be saved.
+ *
+ * Protected by WebAuthn biometric unlock.  Hard capped at 100 entries
+ * per user; the oldest entry is auto-removed when the cap is reached.
+ */
+model MessageVaultEntry {
+  id                 String   @id @default(uuid())
+  userId             String
+  ephemeralMessageId String?
+  encryptedContent   Bytes
+  senderEmail        String
+  subject            String
+  webAuthnCredId     String
+  vaultedAt          DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, vaultedAt])
 }
