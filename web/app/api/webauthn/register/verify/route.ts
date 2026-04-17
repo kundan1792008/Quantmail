@@ -35,6 +35,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Challenge expired" }, { status: 410 });
   }
 
+  if (!challenge.biometricHash || !challenge.webAuthnUserId) {
+    return NextResponse.json(
+      { error: "Challenge is missing biometric registration context" },
+      { status: 400 }
+    );
+  }
+
   let verification: Awaited<ReturnType<typeof verifyRegistrationResponse>>;
 
   try {
@@ -109,8 +116,7 @@ export async function POST(request: Request) {
         where: { id: existingUser.id },
         data: {
           displayName: challenge.displayName ?? existingUser.displayName,
-          webAuthnUserId:
-            existingUser.webAuthnUserId ?? challenge.webAuthnUserId ?? crypto.randomUUID(),
+          webAuthnUserId: existingUser.webAuthnUserId ?? challenge.webAuthnUserId,
           verified: existingUser.verified || Boolean(challenge.biometricHash),
         },
         select: {
@@ -126,8 +132,8 @@ export async function POST(request: Request) {
         data: {
           displayName: challenge.displayName ?? challenge.email,
           email: challenge.email,
-          biometricHash: challenge.biometricHash ?? credentialId,
-          webAuthnUserId: challenge.webAuthnUserId ?? crypto.randomUUID(),
+          biometricHash: challenge.biometricHash,
+          webAuthnUserId: challenge.webAuthnUserId,
           verified: Boolean(challenge.biometricHash),
           digitalTwin: {
             create: {},

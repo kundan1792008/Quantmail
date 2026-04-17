@@ -4,6 +4,8 @@ import type {
   RegistrationResponseJSON,
 } from "@simplewebauthn/server";
 
+const DEFAULT_CHALLENGE_TTL_MS = 300000;
+
 const rpID =
   process.env["WEBAUTHN_RP_ID"] ??
   process.env["NEXT_PUBLIC_WEBAUTHN_RP_ID"] ??
@@ -13,13 +15,17 @@ const rpOrigin = process.env["WEBAUTHN_ORIGIN"] ?? "http://localhost:3000";
 
 const rpName = process.env["WEBAUTHN_RP_NAME"] ?? "Quantmail";
 
-const challengeTtlMs = Number(process.env["WEBAUTHN_CHALLENGE_TTL_MS"] ?? 300000);
+const challengeTtlMs = Number(
+  process.env["WEBAUTHN_CHALLENGE_TTL_MS"] ?? DEFAULT_CHALLENGE_TTL_MS
+);
 
 export const webAuthnConfig = {
   rpID,
   rpOrigin,
   rpName,
-  challengeTtlMs: Number.isFinite(challengeTtlMs) ? challengeTtlMs : 300000,
+  challengeTtlMs: Number.isFinite(challengeTtlMs)
+    ? challengeTtlMs
+    : DEFAULT_CHALLENGE_TTL_MS,
 };
 
 export function challengeExpiresAt(): Date {
@@ -27,7 +33,21 @@ export function challengeExpiresAt(): Date {
 }
 
 export function isValidEmail(value: string): boolean {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+  if (!value || value.length > 254 || value.includes(" ")) {
+    return false;
+  }
+
+  const atIndex = value.indexOf("@");
+  const lastAtIndex = value.lastIndexOf("@");
+
+  if (atIndex <= 0 || atIndex !== lastAtIndex || atIndex === value.length - 1) {
+    return false;
+  }
+
+  const localPart = value.slice(0, atIndex);
+  const domain = value.slice(atIndex + 1);
+
+  return localPart.length > 0 && domain.includes(".") && !domain.startsWith(".") && !domain.endsWith(".");
 }
 
 export function isValidBiometricHash(value: string): boolean {
