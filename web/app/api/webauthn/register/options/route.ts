@@ -60,7 +60,7 @@ export async function POST(request: Request) {
   const options = await generateRegistrationOptions({
     rpID: webAuthnConfig.rpID,
     rpName: webAuthnConfig.rpName,
-    userID: webAuthnUserId,
+    userID: new TextEncoder().encode(webAuthnUserId),
     userName: email,
     userDisplayName: displayName,
     attestationType: "none",
