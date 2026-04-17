@@ -167,10 +167,11 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
    * Generates passkey registration options for a user.
    * Authorization: Bearer <ssoToken>
    */
-  app.post(
-    "/auth/webauthn/register/options",
-    AUTH_RATE_LIMIT,
-    async (request, reply) => {
+  app.post("/auth/webauthn/register/options", {
+    config: {
+      rateLimit: { max: AUTH_RATE_LIMIT_MAX, timeWindow: AUTH_RATE_LIMIT_WINDOW },
+    },
+    handler: async (request, reply) => {
       const authHeader = request.headers["authorization"];
       const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
       if (!token) return reply.code(401).send({ error: "Authorization token required" });
@@ -186,8 +187,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           .code(400)
           .send({ error: err instanceof Error ? err.message : "Failed to generate options" });
       }
-    }
-  );
+    },
+  });
 
   /**
    * POST /auth/webauthn/register/verify
@@ -195,36 +196,38 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
    * Authorization: Bearer <ssoToken>
    * Body: { response: RegistrationResponseJSON, credentialName?: string }
    */
-  app.post<{
-    Body: { response: RegistrationResponseJSON; credentialName?: string };
-  }>(
+  app.post<{ Body: { response: RegistrationResponseJSON; credentialName?: string } }>(
     "/auth/webauthn/register/verify",
-    AUTH_RATE_LIMIT,
-    async (request, reply) => {
-      const authHeader = request.headers["authorization"];
-      const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
-      if (!token) return reply.code(401).send({ error: "Authorization token required" });
+    {
+      config: {
+        rateLimit: { max: AUTH_RATE_LIMIT_MAX, timeWindow: AUTH_RATE_LIMIT_WINDOW },
+      },
+      handler: async (request, reply) => {
+        const authHeader = request.headers["authorization"];
+        const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+        if (!token) return reply.code(401).send({ error: "Authorization token required" });
 
-      const userId = verifyMasterSSOToken(token, SSO_SECRET);
-      if (!userId) return reply.code(401).send({ error: "Invalid or expired token" });
+        const userId = verifyMasterSSOToken(token, SSO_SECRET);
+        if (!userId) return reply.code(401).send({ error: "Invalid or expired token" });
 
-      const { response, credentialName } = request.body;
-      if (!response) return reply.code(400).send({ error: "response field required" });
+        const { response, credentialName } = request.body;
+        if (!response) return reply.code(400).send({ error: "response field required" });
 
-      try {
-        const result = await verifyPasskeyRegistration(userId, response, credentialName);
-        if (!result.verified) {
-          return reply.code(400).send({ error: "Passkey registration verification failed" });
+        try {
+          const result = await verifyPasskeyRegistration(userId, response, credentialName);
+          if (!result.verified) {
+            return reply.code(400).send({ error: "Passkey registration verification failed" });
+          }
+          return reply.code(201).send({
+            message: "Passkey registered successfully",
+            credentialId: result.credentialId,
+          });
+        } catch (err) {
+          return reply
+            .code(400)
+            .send({ error: err instanceof Error ? err.message : "Registration failed" });
         }
-        return reply.code(201).send({
-          message: "Passkey registered successfully",
-          credentialId: result.credentialId,
-        });
-      } catch (err) {
-        return reply
-          .code(400)
-          .send({ error: err instanceof Error ? err.message : "Registration failed" });
-      }
+      },
     }
   );
 
@@ -233,10 +236,11 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
    * Generates passkey authentication options for a user.
    * Body: { email: string }
    */
-  app.post<{ Body: { email: string } }>(
-    "/auth/webauthn/authenticate/options",
-    AUTH_RATE_LIMIT,
-    async (request, reply) => {
+  app.post<{ Body: { email: string } }>("/auth/webauthn/authenticate/options", {
+    config: {
+      rateLimit: { max: AUTH_RATE_LIMIT_MAX, timeWindow: AUTH_RATE_LIMIT_WINDOW },
+    },
+    handler: async (request, reply) => {
       const { email } = request.body;
       if (!email) return reply.code(400).send({ error: "email required" });
 
@@ -254,58 +258,60 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           .code(400)
           .send({ error: err instanceof Error ? err.message : "Failed to generate options" });
       }
-    }
-  );
+    },
+  });
 
   /**
    * POST /auth/webauthn/authenticate/verify
    * Verifies a passkey authentication response and issues session tokens.
    * Body: { email: string, response: AuthenticationResponseJSON }
    */
-  app.post<{
-    Body: { email: string; response: AuthenticationResponseJSON };
-  }>(
+  app.post<{ Body: { email: string; response: AuthenticationResponseJSON } }>(
     "/auth/webauthn/authenticate/verify",
-    AUTH_RATE_LIMIT,
-    async (request, reply) => {
-      const { email, response } = request.body;
-      if (!email || !response) {
-        return reply.code(400).send({ error: "email and response fields required" });
-      }
-
-      const user = await prisma.user.findUnique({ where: { email } });
-      if (!user) {
-        return reply.code(404).send({ error: "User not found" });
-      }
-
-      try {
-        const result = await verifyPasskeyAuthentication(user.id, response);
-        if (!result.verified) {
-          return reply.code(401).send({ error: "Passkey authentication failed" });
+    {
+      config: {
+        rateLimit: { max: AUTH_RATE_LIMIT_MAX, timeWindow: AUTH_RATE_LIMIT_WINDOW },
+      },
+      handler: async (request, reply) => {
+        const { email, response } = request.body;
+        if (!email || !response) {
+          return reply.code(400).send({ error: "email and response fields required" });
         }
 
-        const ip = (request.headers["x-forwarded-for"] as string) || request.ip || "";
-        const userAgent = request.headers["user-agent"] || "";
+        const user = await prisma.user.findUnique({ where: { email } });
+        if (!user) {
+          return reply.code(404).send({ error: "User not found" });
+        }
 
-        const tokens = await issueSessionTokens(
-          user.id,
-          user.biometricHash,
-          { userAgent, ip },
-          "full"
-        );
+        try {
+          const result = await verifyPasskeyAuthentication(user.id, response);
+          if (!result.verified) {
+            return reply.code(401).send({ error: "Passkey authentication failed" });
+          }
 
-        return reply.send({
-          user: { id: user.id, displayName: user.displayName, email: user.email },
-          accessToken: tokens.accessToken,
-          refreshToken: tokens.refreshToken,
-          expiresAt: tokens.expiresAt,
-          sessionId: tokens.sessionId,
-        });
-      } catch (err) {
-        return reply
-          .code(401)
-          .send({ error: err instanceof Error ? err.message : "Authentication failed" });
-      }
+          const ip = (request.headers["x-forwarded-for"] as string) || request.ip || "";
+          const userAgent = request.headers["user-agent"] || "";
+
+          const tokens = await issueSessionTokens(
+            user.id,
+            user.biometricHash,
+            { userAgent, ip },
+            "full"
+          );
+
+          return reply.send({
+            user: { id: user.id, displayName: user.displayName, email: user.email },
+            accessToken: tokens.accessToken,
+            refreshToken: tokens.refreshToken,
+            expiresAt: tokens.expiresAt,
+            sessionId: tokens.sessionId,
+          });
+        } catch (err) {
+          return reply
+            .code(401)
+            .send({ error: err instanceof Error ? err.message : "Authentication failed" });
+        }
+      },
     }
   );
 
@@ -345,10 +351,11 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
    * Issues a new access token using a valid refresh token.
    * Body: { refreshToken: string }
    */
-  app.post<{ Body: { refreshToken: string } }>(
-    "/auth/refresh",
-    AUTH_RATE_LIMIT,
-    async (request, reply) => {
+  app.post<{ Body: { refreshToken: string } }>("/auth/refresh", {
+    config: {
+      rateLimit: { max: AUTH_RATE_LIMIT_MAX, timeWindow: AUTH_RATE_LIMIT_WINDOW },
+    },
+    handler: async (request, reply) => {
       const { refreshToken } = request.body;
       if (!refreshToken) return reply.code(400).send({ error: "refreshToken required" });
 
@@ -368,6 +375,6 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         expiresAt: tokens.expiresAt,
         sessionId: tokens.sessionId,
       });
-    }
-  );
+    },
+  });
 }
