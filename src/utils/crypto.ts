@@ -26,10 +26,15 @@ export function deriveBiometricHash(facialMatrixData: string): string {
     .digest("hex");
 }
 
-export function generateMasterSSOToken(userId: string, secret: string): string {
+/** Default token lifetime: 24 hours in milliseconds. */
+const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+
+export function generateMasterSSOToken(userId: string, secret: string, ttlMs = TOKEN_TTL_MS): string {
+  const now = Date.now();
   const payload = JSON.stringify({
     sub: userId,
-    iat: Date.now(),
+    iat: now,
+    exp: now + ttlMs,
     jti: uuidv4(),
   });
   const signature = CryptoJS.HmacSHA256(payload, secret).toString(CryptoJS.enc.Hex);
@@ -45,7 +50,8 @@ export function verifyMasterSSOToken(token: string, secret: string): string | nu
     const payload = Buffer.from(encoded, "base64url").toString("utf-8");
     const expectedSig = CryptoJS.HmacSHA256(payload, secret).toString(CryptoJS.enc.Hex);
     if (signature !== expectedSig) return null;
-    const parsed = JSON.parse(payload) as { sub: string };
+    const parsed = JSON.parse(payload) as { sub: string; exp?: number };
+    if (parsed.exp !== undefined && Date.now() > parsed.exp) return null;
     return parsed.sub;
   } catch {
     return null;
