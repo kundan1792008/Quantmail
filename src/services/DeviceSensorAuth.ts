@@ -1,814 +1,489 @@
 /**
  * DeviceSensorAuth
- * ================
  *
- * Device-level behavioral biometric layer. Combines two very different
- * signal sources into a single confidence score that can be consumed by
- * {@link ContinuousAuthMiddleware}:
+ * Builds a device confidence score from:
  *
- *   Mobile:
- *     - Gyroscope tilt patterns while the user holds the phone.
- *     - Accelerometer "noise floor" at rest — this is surprisingly stable
- *       per device because of manufacturing tolerances in the MEMS
- *       sensors.
- *     - Orientation / pitch / roll distributions.
+ * Mobile sensors:
+ *   - Gyroscope tilt patterns while holding the device
+ *   - Accelerometer noise floor (unique per physical device)
  *
- *   Desktop:
- *     - GPU / WebGL renderer string + vendor.
- *     - AudioContext fingerprint (OfflineAudioContext oscillator hash).
- *     - Screen color profile (color depth, width, height, gamut, DPR).
- *     - Installed font / plugin hashes provided by the client.
+ * Desktop fingerprinting:
+ *   - GPU fingerprint derived from WebGL renderer info
+ *   - Audio context fingerprint (oscillator frequency response)
+ *   - Screen colour profile (colour depth, pixel ratio, gamut)
  *
- * For each user the module stores a *device signature*. Every subsequent
- * ping compares the live sensor reading against the signature and emits
- * a 0..1 score. If the signature drifts too far, the middleware treats
- * it as an anomaly identical to a failing typing/mouse check.
- *
- * All server-side work is deterministic and synchronous: the heavy
- * lifting (WebGL probing, audio oscillator sampling) happens on the
- * client and is delivered here as a JSON bundle.
+ * All fingerprint inputs are hashed into a stable device ID and
+ * compared against the device IDs previously enrolled for the user.
+ * The result is a [0, 1] device confidence score and a boolean
+ * indicating whether the device is recognised.
  */
 
-import { createHash } from "node:crypto";
+import { createHash } from "crypto";
 
-// ─── Public Types ────────────────────────────────────────────────────────────
-
-export type DeviceKind = "mobile" | "desktop";
-
-/** One raw sample from a motion sensor. All axes in m/s² or rad/s. */
-export interface MotionSample {
-  readonly t: number;
-  readonly x: number;
-  readonly y: number;
-  readonly z: number;
-}
-
-/** A single "tick" of orientation data. */
-export interface OrientationSample {
-  readonly t: number;
-  readonly alpha: number; // z-axis rotation (0..360°)
-  readonly beta: number; // x-axis tilt (-180..180°)
-  readonly gamma: number; // y-axis tilt (-90..90°)
-}
+// ─── Constants ────────────────────────────────────────────────────────────────
 
 /**
- * Payload submitted by a mobile device. Sample rates are expected to be
- * at least ~20 Hz; bursts shorter than 2 seconds are rejected.
+ * Minimum number of stored device fingerprints needed before confidence
+ * scoring is considered reliable.
  */
-export interface MobileSensorBundle {
-  readonly deviceKind: "mobile";
-  readonly deviceId: string;
-  readonly capturedAt: number;
-  readonly gyroscope: readonly MotionSample[];
-  readonly accelerometer: readonly MotionSample[];
-  readonly orientation?: readonly OrientationSample[];
-  readonly screen?: ScreenInfo;
-  readonly userAgent?: string;
-}
+const MIN_ENROLLED_DEVICES = 1;
 
 /**
- * Payload submitted by a desktop device. The client precomputes the
- * fingerprints locally and sends only the hashed / truncated results —
- * this keeps us from inhaling megabytes of WebGL probe output.
+ * Maximum number of devices that may be enrolled per user.
+ * Exceeding this causes the oldest fingerprint to be evicted.
  */
-export interface DesktopSensorBundle {
-  readonly deviceKind: "desktop";
-  readonly deviceId: string;
-  readonly capturedAt: number;
-  readonly webgl?: WebGlFingerprint;
-  readonly audio?: AudioFingerprint;
-  readonly screen?: ScreenInfo;
-  readonly fontHash?: string;
-  readonly pluginHash?: string;
-  readonly userAgent?: string;
-  readonly timezone?: string;
-  readonly languages?: readonly string[];
+const MAX_DEVICES_PER_USER = 10;
+
+/**
+ * How many gyroscope samples are required to form a tilt-pattern signature.
+ */
+const GYRO_SIGNATURE_SAMPLES = 100;
+
+/**
+ * Maximum standard deviation (deg/s) of gyroscope noise considered "normal"
+ * for a stably-held device.  Significantly higher values suggest the device
+ * is on a motorised mount or the readings are synthetic.
+ */
+const GYRO_NOISE_THRESHOLD = 15.0;
+
+// ─── Types ─────────────────────────────────────────────────────────────────────
+
+/** Gyroscope sample captured from the DeviceMotionEvent / sensor API. */
+export interface GyroscopeSample {
+  /** Rotation rate around X axis in degrees/second. */
+  alpha: number;
+  /** Rotation rate around Y axis in degrees/second. */
+  beta: number;
+  /** Rotation rate around Z axis in degrees/second. */
+  gamma: number;
+  /** Unix timestamp (ms). */
+  timestamp: number;
 }
 
-export type DeviceSensorBundle = MobileSensorBundle | DesktopSensorBundle;
-
-export interface WebGlFingerprint {
-  readonly vendor?: string;
-  readonly renderer?: string;
-  readonly version?: string;
-  readonly shadingLanguageVersion?: string;
-  readonly maxTextureSize?: number;
-  readonly extensionsHash?: string;
+/** Accelerometer sample. */
+export interface AccelerometerSample {
+  /** Acceleration along X axis in m/s². */
+  x: number;
+  /** Acceleration along Y axis in m/s². */
+  y: number;
+  /** Acceleration along Z axis in m/s². */
+  z: number;
+  /** Unix timestamp (ms). */
+  timestamp: number;
 }
 
+/** WebGL GPU fingerprint payload (extracted in the browser). */
+export interface WebGLFingerprint {
+  /** WEBGL_debug_renderer_info UNMASKED_RENDERER_WEBGL string. */
+  renderer: string;
+  /** WEBGL_debug_renderer_info UNMASKED_VENDOR_WEBGL string. */
+  vendor: string;
+  /** Max texture size. */
+  maxTextureSize: number;
+  /** Supported extension count. */
+  extensionCount: number;
+  /** Floating-point hash of a rendered gradient canvas (browser-side). */
+  canvasHash: string;
+}
+
+/** Audio context fingerprint payload (extracted in the browser). */
 export interface AudioFingerprint {
-  readonly sampleRate?: number;
-  readonly oscillatorHash?: string;
-  readonly outputHash?: string;
-  readonly channelCount?: number;
-}
-
-export interface ScreenInfo {
-  readonly width: number;
-  readonly height: number;
-  readonly colorDepth?: number;
-  readonly pixelRatio?: number;
-  readonly gamut?: string;
-  readonly orientation?: string;
-}
-
-/**
- * Per-user, per-device stored signature. Everything is a number or hash
- * so the whole object is cheap to serialize to JSON / Postgres.
- */
-export interface DeviceSignature {
-  readonly userId: string;
-  readonly deviceId: string;
-  readonly deviceKind: DeviceKind;
-  readonly sampleCount: number;
-  readonly updatedAt: number;
-  readonly version: number;
-
-  // Mobile features
-  readonly gyroMagnitudeMean: number;
-  readonly gyroMagnitudeStd: number;
-  readonly accelNoiseFloor: number;
-  readonly accelNoiseStd: number;
-  readonly tiltBetaMean: number;
-  readonly tiltGammaMean: number;
-  readonly tiltBetaStd: number;
-  readonly tiltGammaStd: number;
-  readonly gravityMagnitudeMean: number;
-
-  // Desktop features
-  readonly webglVendorHash: string;
-  readonly webglRendererHash: string;
-  readonly webglExtensionsHash: string;
-  readonly audioOscillatorHash: string;
-  readonly audioSampleRate: number;
-  readonly fontHash: string;
-  readonly pluginHash: string;
-  readonly timezone: string;
-  readonly languageHash: string;
-
-  // Shared
-  readonly screenHash: string;
-  readonly userAgentHash: string;
-}
-
-export interface DeviceComparisonResult {
-  readonly userId: string;
-  readonly deviceId: string;
-  readonly deviceKind: DeviceKind;
-  readonly score: number; // 0..1, 1 = identical
-  readonly distance: number;
-  readonly anomalous: boolean;
-  readonly mismatches: readonly string[];
-  readonly computedAt: number;
-}
-
-// ─── Constants ───────────────────────────────────────────────────────────────
-
-export const DeviceSensorConstants = Object.freeze({
-  MIN_MOTION_SAMPLES: 40,
-  MAX_MOTION_SAMPLES: 5_000,
-  MIN_SAMPLE_SPAN_MS: 2_000,
-  SIGNATURE_VERSION: 1,
-  ANOMALY_THRESHOLD: 0.55, // distance above this ⇒ anomaly
-  // Weighting of individual mismatch contributions to the total distance.
-  WEIGHTS: Object.freeze({
-    webglVendor: 0.12,
-    webglRenderer: 0.15,
-    webglExtensions: 0.08,
-    audioHash: 0.1,
-    audioSampleRate: 0.05,
-    fontHash: 0.05,
-    pluginHash: 0.05,
-    timezone: 0.05,
-    screen: 0.05,
-    userAgent: 0.05,
-    languages: 0.03,
-    gyro: 0.1,
-    accel: 0.07,
-    tilt: 0.05,
-  }),
-} as const);
-
-// ─── Hashing & small utilities ───────────────────────────────────────────────
-
-/** Short, stable SHA-256 hex digest. Empty inputs hash to empty string. */
-export function stableHash(input: string | undefined | null, bytes = 16): string {
-  if (input == null || input === "") return "";
-  return createHash("sha256").update(input).digest("hex").slice(0, bytes * 2);
-}
-
-function hashMany(parts: readonly (string | number | undefined | null)[]): string {
-  const joined = parts
-    .map((p) => (p == null ? "" : String(p)))
-    .join("|");
-  return stableHash(joined);
-}
-
-function clampMagnitudeSeries(samples: readonly MotionSample[]): number[] {
-  const out: number[] = [];
-  for (let i = 0; i < samples.length; i += 1) {
-    const s = samples[i]!;
-    const m = Math.hypot(s.x, s.y, s.z);
-    if (Number.isFinite(m)) out.push(m);
-  }
-  return out;
-}
-
-function mean(xs: readonly number[]): number {
-  if (xs.length === 0) return 0;
-  let s = 0;
-  for (let i = 0; i < xs.length; i += 1) s += xs[i]!;
-  return s / xs.length;
-}
-
-function stdDev(xs: readonly number[]): number {
-  if (xs.length < 2) return 0;
-  const m = mean(xs);
-  let acc = 0;
-  for (let i = 0; i < xs.length; i += 1) {
-    const d = xs[i]! - m;
-    acc += d * d;
-  }
-  return Math.sqrt(acc / xs.length);
-}
-
-/**
- * Noise floor — the standard deviation of the high-frequency component
- * of the accelerometer magnitude after subtracting a 5-sample moving
- * average. Bot / emulator accelerometer streams are typically too clean
- * here, while real devices have a ~0.02..0.06 m/s² noise band that is
- * stable per device.
- */
-export function accelerometerNoiseFloor(samples: readonly MotionSample[]): number {
-  const mags = clampMagnitudeSeries(samples);
-  if (mags.length < 6) return 0;
-  const smooth = new Array<number>(mags.length);
-  const win = 5;
-  for (let i = 0; i < mags.length; i += 1) {
-    const lo = Math.max(0, i - win);
-    const hi = Math.min(mags.length, i + win + 1);
-    let s = 0;
-    for (let j = lo; j < hi; j += 1) s += mags[j]!;
-    smooth[i] = s / (hi - lo);
-  }
-  const residual = new Array<number>(mags.length);
-  for (let i = 0; i < mags.length; i += 1) residual[i] = mags[i]! - smooth[i]!;
-  return stdDev(residual);
-}
-
-/**
- * Compute a single numeric gravity magnitude estimate from
- * accelerometer data. For a stationary-ish phone this is ~9.81 m/s²,
- * but devices differ in their calibration offset by up to ~0.2 m/s².
- */
-export function gravityEstimate(samples: readonly MotionSample[]): number {
-  const mags = clampMagnitudeSeries(samples);
-  if (mags.length === 0) return 0;
-  // Use the p50 — robust to jitter.
-  const sorted = [...mags].sort((a, b) => a - b);
-  return sorted[Math.floor(sorted.length / 2)]!;
-}
-
-// ─── Signature building ──────────────────────────────────────────────────────
-
-function emptySignatureDefaults(): Omit<
-  DeviceSignature,
-  "userId" | "deviceId" | "deviceKind" | "updatedAt" | "sampleCount"
-> {
-  return {
-    version: DeviceSensorConstants.SIGNATURE_VERSION,
-    gyroMagnitudeMean: 0,
-    gyroMagnitudeStd: 0,
-    accelNoiseFloor: 0,
-    accelNoiseStd: 0,
-    tiltBetaMean: 0,
-    tiltGammaMean: 0,
-    tiltBetaStd: 0,
-    tiltGammaStd: 0,
-    gravityMagnitudeMean: 0,
-    webglVendorHash: "",
-    webglRendererHash: "",
-    webglExtensionsHash: "",
-    audioOscillatorHash: "",
-    audioSampleRate: 0,
-    fontHash: "",
-    pluginHash: "",
-    timezone: "",
-    languageHash: "",
-    screenHash: "",
-    userAgentHash: "",
-  };
-}
-
-function screenHashOf(screen: ScreenInfo | undefined): string {
-  if (!screen) return "";
-  return hashMany([
-    screen.width,
-    screen.height,
-    screen.colorDepth,
-    screen.pixelRatio,
-    screen.gamut,
-    screen.orientation,
-  ]);
-}
-
-export function buildSignatureFromBundle(
-  userId: string,
-  bundle: DeviceSensorBundle
-): DeviceSignature {
-  const base = emptySignatureDefaults();
-  const common = {
-    userId,
-    deviceId: bundle.deviceId,
-    deviceKind: bundle.deviceKind,
-    updatedAt: Date.now(),
-    screenHash: screenHashOf(bundle.screen),
-    userAgentHash: stableHash(bundle.userAgent ?? ""),
-  };
-
-  if (bundle.deviceKind === "mobile") {
-    const gyroMags = clampMagnitudeSeries(bundle.gyroscope);
-    const noiseFloor = accelerometerNoiseFloor(bundle.accelerometer);
-    const gravity = gravityEstimate(bundle.accelerometer);
-    const betas: number[] = [];
-    const gammas: number[] = [];
-    for (const o of bundle.orientation ?? []) {
-      if (Number.isFinite(o.beta)) betas.push(o.beta);
-      if (Number.isFinite(o.gamma)) gammas.push(o.gamma);
-    }
-    return {
-      ...base,
-      ...common,
-      sampleCount: bundle.gyroscope.length + bundle.accelerometer.length,
-      gyroMagnitudeMean: mean(gyroMags),
-      gyroMagnitudeStd: stdDev(gyroMags),
-      accelNoiseFloor: noiseFloor,
-      accelNoiseStd: stdDev(clampMagnitudeSeries(bundle.accelerometer)),
-      tiltBetaMean: mean(betas),
-      tiltGammaMean: mean(gammas),
-      tiltBetaStd: stdDev(betas),
-      tiltGammaStd: stdDev(gammas),
-      gravityMagnitudeMean: gravity,
-    };
-  }
-
-  // Desktop
-  return {
-    ...base,
-    ...common,
-    sampleCount: 1,
-    webglVendorHash: stableHash(bundle.webgl?.vendor ?? ""),
-    webglRendererHash: stableHash(bundle.webgl?.renderer ?? ""),
-    webglExtensionsHash: bundle.webgl?.extensionsHash ?? "",
-    audioOscillatorHash: bundle.audio?.oscillatorHash ?? "",
-    audioSampleRate: bundle.audio?.sampleRate ?? 0,
-    fontHash: bundle.fontHash ?? "",
-    pluginHash: bundle.pluginHash ?? "",
-    timezone: bundle.timezone ?? "",
-    languageHash: stableHash((bundle.languages ?? []).join(",")),
-  };
-}
-
-// ─── Comparison helpers ──────────────────────────────────────────────────────
-
-function zish(delta: number, base: number): number {
-  // normalize a numeric delta to a 0..1 "distance" contribution
-  const b = Math.max(Math.abs(base), 1e-3);
-  return Math.min(1, Math.abs(delta) / b);
-}
-
-function strictHashDistance(a: string, b: string): number {
-  if (!a && !b) return 0; // both unknown — no distance
-  if (!a || !b) return 0.5; // one side unknown
-  return a === b ? 0 : 1;
-}
-
-function scalarTolerance(a: number, b: number, tol: number): number {
-  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
-  const delta = Math.abs(a - b);
-  if (delta <= tol) return 0;
-  return Math.min(1, (delta - tol) / Math.max(tol, 1e-3));
-}
-
-/**
- * Compare a live sensor bundle against a stored signature, producing a
- * weighted distance plus a list of the biggest mismatch contributors.
- *
- * The distance is a weighted sum of per-feature distances, where each
- * contribution is in [0, 1]. Total weights sum to 1, so the output
- * distance is also bounded by 1.
- */
-export function compareBundle(
-  signature: DeviceSignature,
-  bundle: DeviceSensorBundle
-): DeviceComparisonResult {
-  if (signature.deviceKind !== bundle.deviceKind) {
-    return {
-      userId: signature.userId,
-      deviceId: signature.deviceId,
-      deviceKind: signature.deviceKind,
-      score: 0,
-      distance: 1,
-      anomalous: true,
-      mismatches: ["deviceKind"],
-      computedAt: Date.now(),
-    };
-  }
-  const W = DeviceSensorConstants.WEIGHTS;
-  const mismatches: string[] = [];
-  let distance = 0;
-
-  const liveBase = buildSignatureFromBundle(signature.userId, bundle);
-
-  const addHash = (name: string, w: number, a: string, b: string): void => {
-    const d = strictHashDistance(a, b);
-    if (d > 0) mismatches.push(name);
-    distance += w * d;
-  };
-
-  // Shared
-  addHash("screen", W.screen, signature.screenHash, liveBase.screenHash);
-  addHash("userAgent", W.userAgent, signature.userAgentHash, liveBase.userAgentHash);
-
-  if (bundle.deviceKind === "mobile") {
-    // gyro magnitude — tolerance 0.15 rad/s
-    const dGyro = scalarTolerance(
-      signature.gyroMagnitudeMean,
-      liveBase.gyroMagnitudeMean,
-      0.15
-    );
-    if (dGyro > 0.2) mismatches.push("gyroMagnitudeMean");
-    distance += W.gyro * dGyro;
-
-    // accel noise floor — tolerance 0.02 m/s²
-    const dAccel = scalarTolerance(
-      signature.accelNoiseFloor,
-      liveBase.accelNoiseFloor,
-      0.02
-    );
-    if (dAccel > 0.2) mismatches.push("accelNoiseFloor");
-    distance += W.accel * dAccel;
-
-    // tilt mean — tolerance 10°
-    const dTilt =
-      (scalarTolerance(signature.tiltBetaMean, liveBase.tiltBetaMean, 10) +
-        scalarTolerance(signature.tiltGammaMean, liveBase.tiltGammaMean, 10)) /
-      2;
-    if (dTilt > 0.3) mismatches.push("tilt");
-    distance += W.tilt * dTilt;
-  } else {
-    addHash("webglVendor", W.webglVendor, signature.webglVendorHash, liveBase.webglVendorHash);
-    addHash("webglRenderer", W.webglRenderer, signature.webglRendererHash, liveBase.webglRendererHash);
-    addHash("webglExtensions", W.webglExtensions, signature.webglExtensionsHash, liveBase.webglExtensionsHash);
-    addHash("audioOscillator", W.audioHash, signature.audioOscillatorHash, liveBase.audioOscillatorHash);
-    addHash("fontHash", W.fontHash, signature.fontHash, liveBase.fontHash);
-    addHash("pluginHash", W.pluginHash, signature.pluginHash, liveBase.pluginHash);
-    addHash("languages", W.languages, signature.languageHash, liveBase.languageHash);
-    addHash("timezone", W.timezone, signature.timezone, liveBase.timezone);
-
-    const dRate = scalarTolerance(signature.audioSampleRate, liveBase.audioSampleRate, 1);
-    if (dRate > 0) mismatches.push("audioSampleRate");
-    distance += W.audioSampleRate * dRate;
-  }
-
-  const clamped = Math.max(0, Math.min(1, distance));
-  const score = 1 - clamped;
-  return {
-    userId: signature.userId,
-    deviceId: signature.deviceId,
-    deviceKind: signature.deviceKind,
-    score,
-    distance: clamped,
-    anomalous: clamped >= DeviceSensorConstants.ANOMALY_THRESHOLD,
-    mismatches,
-    computedAt: Date.now(),
-  };
-}
-
-// ─── Validation ──────────────────────────────────────────────────────────────
-
-/**
- * Validate a sensor bundle before ingest. The rules are:
- *   - Mobile bundles must include enough motion samples over at least
- *     {@link DeviceSensorConstants.MIN_SAMPLE_SPAN_MS}.
- *   - Desktop bundles must include at least a screen + user-agent, or
- *     one of the fingerprints.
- *
- * On success the bundle is returned (narrowed & cloned with bounded
- * arrays). On failure a tagged error is returned.
- */
-export type ValidationOk<T> = { readonly ok: true; readonly value: T };
-export type ValidationErr = { readonly ok: false; readonly error: string };
-export type ValidationResult<T> = ValidationOk<T> | ValidationErr;
-
-export function validateBundle(raw: unknown): ValidationResult<DeviceSensorBundle> {
-  if (!raw || typeof raw !== "object") return { ok: false, error: "EMPTY_BUNDLE" };
-  const r = raw as Partial<DeviceSensorBundle> & Record<string, unknown>;
-  if (r.deviceKind !== "mobile" && r.deviceKind !== "desktop") {
-    return { ok: false, error: "BAD_DEVICE_KIND" };
-  }
-  if (typeof r.deviceId !== "string" || r.deviceId.length === 0) {
-    return { ok: false, error: "MISSING_DEVICE_ID" };
-  }
-  if (typeof r.capturedAt !== "number" || !Number.isFinite(r.capturedAt)) {
-    return { ok: false, error: "BAD_CAPTURED_AT" };
-  }
-
-  if (r.deviceKind === "mobile") {
-    const gyro = Array.isArray(r.gyroscope) ? (r.gyroscope as MotionSample[]) : [];
-    const accel = Array.isArray(r.accelerometer) ? (r.accelerometer as MotionSample[]) : [];
-    if (
-      gyro.length < DeviceSensorConstants.MIN_MOTION_SAMPLES ||
-      accel.length < DeviceSensorConstants.MIN_MOTION_SAMPLES
-    ) {
-      return { ok: false, error: "NOT_ENOUGH_SAMPLES" };
-    }
-    const span =
-      Math.max(accel[accel.length - 1]?.t ?? 0, gyro[gyro.length - 1]?.t ?? 0) -
-      Math.min(accel[0]?.t ?? 0, gyro[0]?.t ?? 0);
-    if (span < DeviceSensorConstants.MIN_SAMPLE_SPAN_MS) {
-      return { ok: false, error: "SAMPLE_SPAN_TOO_SHORT" };
-    }
-    const mobile: MobileSensorBundle = {
-      deviceKind: "mobile",
-      deviceId: r.deviceId,
-      capturedAt: r.capturedAt,
-      gyroscope: gyro.slice(0, DeviceSensorConstants.MAX_MOTION_SAMPLES),
-      accelerometer: accel.slice(0, DeviceSensorConstants.MAX_MOTION_SAMPLES),
-      ...(Array.isArray(r.orientation)
-        ? { orientation: (r.orientation as OrientationSample[]).slice(0, DeviceSensorConstants.MAX_MOTION_SAMPLES) }
-        : {}),
-      ...(r.screen ? { screen: r.screen as ScreenInfo } : {}),
-      ...(typeof r.userAgent === "string" ? { userAgent: r.userAgent } : {}),
-    };
-    return { ok: true, value: mobile };
-  }
-
-  const desktop: DesktopSensorBundle = {
-    deviceKind: "desktop",
-    deviceId: r.deviceId,
-    capturedAt: r.capturedAt,
-    ...(r.webgl ? { webgl: r.webgl as WebGlFingerprint } : {}),
-    ...(r.audio ? { audio: r.audio as AudioFingerprint } : {}),
-    ...(r.screen ? { screen: r.screen as ScreenInfo } : {}),
-    ...(typeof r.fontHash === "string" ? { fontHash: r.fontHash } : {}),
-    ...(typeof r.pluginHash === "string" ? { pluginHash: r.pluginHash } : {}),
-    ...(typeof r.userAgent === "string" ? { userAgent: r.userAgent } : {}),
-    ...(typeof r.timezone === "string" ? { timezone: r.timezone } : {}),
-    ...(Array.isArray(r.languages)
-      ? { languages: (r.languages as string[]).filter((x) => typeof x === "string") }
-      : {}),
-  };
-  // Require at least one identifying field.
-  const ok = Boolean(
-    desktop.webgl || desktop.audio || desktop.screen || desktop.fontHash || desktop.userAgent
-  );
-  if (!ok) return { ok: false, error: "NO_FINGERPRINT" };
-  return { ok: true, value: desktop };
-}
-
-// ─── Store ───────────────────────────────────────────────────────────────────
-
-interface UserDeviceState {
-  readonly userId: string;
-  readonly devices: Map<string, DeviceSignature>;
-  lastResult: DeviceComparisonResult | null;
-  pendingAttempts: number;
-}
-
-function newUserDeviceState(userId: string): UserDeviceState {
-  return {
-    userId,
-    devices: new Map(),
-    lastResult: null,
-    pendingAttempts: 0,
-  };
-}
-
-export interface DeviceSensorStore {
-  load(userId: string): UserDeviceState | null;
-  save(userId: string, s: UserDeviceState): void;
-  delete(userId: string): void;
-}
-
-class InMemoryDeviceStore implements DeviceSensorStore {
-  private readonly m = new Map<string, UserDeviceState>();
-  load(userId: string): UserDeviceState | null {
-    return this.m.get(userId) ?? null;
-  }
-  save(userId: string, s: UserDeviceState): void {
-    this.m.set(userId, s);
-  }
-  delete(userId: string): void {
-    this.m.delete(userId);
-  }
-}
-
-// ─── Service ─────────────────────────────────────────────────────────────────
-
-export class DeviceSensorAuth {
-  private readonly store: DeviceSensorStore;
-  constructor(store?: DeviceSensorStore) {
-    this.store = store ?? new InMemoryDeviceStore();
-  }
-
   /**
-   * Enroll (or update) a device signature from a validated bundle.
-   * Subsequent bundles for the same deviceId merge their features using
-   * a moving average so the signature slowly adapts to small device
-   * drift (e.g. sensor aging).
+   * Sum of oscillator output samples after passing through a biquad filter.
+   * This value is stable per browser/OS/hardware combination.
    */
-  enroll(userId: string, bundle: DeviceSensorBundle): DeviceSignature {
-    const state = this.store.load(userId) ?? newUserDeviceState(userId);
-    const fresh = buildSignatureFromBundle(userId, bundle);
-    const existing = state.devices.get(bundle.deviceId);
-    const merged = existing ? mergeSignatures(existing, fresh) : fresh;
-    state.devices.set(bundle.deviceId, merged);
-    this.store.save(userId, state);
-    return merged;
-  }
-
-  getSignature(userId: string, deviceId: string): DeviceSignature | null {
-    return this.store.load(userId)?.devices.get(deviceId) ?? null;
-  }
-
-  listDevices(userId: string): DeviceSignature[] {
-    const state = this.store.load(userId);
-    if (!state) return [];
-    return Array.from(state.devices.values());
-  }
-
-  removeDevice(userId: string, deviceId: string): boolean {
-    const state = this.store.load(userId);
-    if (!state) return false;
-    const ok = state.devices.delete(deviceId);
-    if (ok) this.store.save(userId, state);
-    return ok;
-  }
-
-  compare(userId: string, bundle: DeviceSensorBundle): DeviceComparisonResult {
-    const state = this.store.load(userId) ?? newUserDeviceState(userId);
-    const sig = state.devices.get(bundle.deviceId);
-    let result: DeviceComparisonResult;
-    if (!sig) {
-      result = {
-        userId,
-        deviceId: bundle.deviceId,
-        deviceKind: bundle.deviceKind,
-        score: 0.5,
-        distance: 0.5,
-        anomalous: false,
-        mismatches: ["NEW_DEVICE"],
-        computedAt: Date.now(),
-      };
-    } else {
-      result = compareBundle(sig, bundle);
-    }
-    state.lastResult = result;
-    this.store.save(userId, state);
-    return result;
-  }
-
-  score(userId: string, deviceId?: string): number {
-    const state = this.store.load(userId);
-    if (!state || state.devices.size === 0) return 1; // no enrolled device yet
-    if (deviceId) {
-      const last = state.lastResult;
-      if (last && last.deviceId === deviceId) return last.score;
-      return 1;
-    }
-    return state.lastResult?.score ?? 1;
-  }
-
-  lastResult(userId: string): DeviceComparisonResult | null {
-    return this.store.load(userId)?.lastResult ?? null;
-  }
-
-  snapshot(userId: string): Record<string, unknown> {
-    const s = this.store.load(userId);
-    if (!s) return { userId, present: false };
-    return {
-      userId,
-      present: true,
-      deviceCount: s.devices.size,
-      devices: Array.from(s.devices.values()).map((d) => ({
-        deviceId: d.deviceId,
-        deviceKind: d.deviceKind,
-        sampleCount: d.sampleCount,
-        updatedAt: d.updatedAt,
-      })),
-      lastResult: s.lastResult,
-    };
-  }
-
-  reset(userId: string): void {
-    this.store.delete(userId);
-  }
+  sampleSum: number;
+  /** Sample rate of the AudioContext. */
+  sampleRate: number;
+  /** Channel count. */
+  channelCount: number;
 }
 
-/** Moving-average merge so a signature adapts to small per-session drift. */
-function mergeSignatures(
-  prev: DeviceSignature,
-  next: DeviceSignature
-): DeviceSignature {
-  // Prefer hash identity when both sides agree; otherwise keep the
-  // newest. For scalar sensor values use an EMA with α=0.2.
-  const alpha = 0.2;
-  const ema = (a: number, b: number): number => a * (1 - alpha) + b * alpha;
+/** Screen / colour profile payload. */
+export interface ScreenProfile {
+  /** Screen colour depth (bits). */
+  colorDepth: number;
+  /** Device pixel ratio. */
+  pixelRatio: number;
+  /** Screen width in physical pixels. */
+  screenWidth: number;
+  /** Screen height in physical pixels. */
+  screenHeight: number;
+  /** Whether the CSS `color-gamut: p3` media query matched. */
+  hasP3Gamut: boolean;
+  /** Whether HDR is available (`dynamic-range: high`). */
+  hasHDR: boolean;
+}
+
+/** Full device telemetry payload sent from the client. */
+export interface DeviceTelemetry {
+  /** Platform hint: "mobile" or "desktop". */
+  platform: "mobile" | "desktop";
+  gyroSamples?: GyroscopeSample[];
+  accelSamples?: AccelerometerSample[];
+  webgl?: WebGLFingerprint;
+  audio?: AudioFingerprint;
+  screen?: ScreenProfile;
+  /** ISO timestamp of collection. */
+  collectedAt: string;
+}
+
+/** Result of a device confidence evaluation. */
+export interface DeviceAuthResult {
+  userId: string;
+  deviceId: string;
+  isKnownDevice: boolean;
+  confidence: number;
+  signals: {
+    gyroScore: number;
+    accelScore: number;
+    webglScore: number;
+    audioScore: number;
+    screenScore: number;
+  };
+  anomalies: string[];
+  evaluatedAt: string;
+}
+
+/** An enrolled device record. */
+export interface EnrolledDevice {
+  deviceId: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  platform: "mobile" | "desktop";
+  /** Confidence score at enrolment time. */
+  enrolledConfidence: number;
+}
+
+// ─── In-memory device store ───────────────────────────────────────────────────
+
+const enrolledDeviceStore = new Map<string, EnrolledDevice[]>();
+
+// ─── Fingerprint Hashing ──────────────────────────────────────────────────────
+
+/**
+ * Produces a stable 64-hex-character device ID from raw fingerprint signals.
+ */
+export function computeDeviceId(telemetry: DeviceTelemetry): string {
+  const components: string[] = [telemetry.platform];
+
+  if (telemetry.webgl) {
+    components.push(
+      telemetry.webgl.renderer,
+      telemetry.webgl.vendor,
+      String(telemetry.webgl.maxTextureSize),
+      String(telemetry.webgl.extensionCount),
+      telemetry.webgl.canvasHash
+    );
+  }
+
+  if (telemetry.audio) {
+    // Round to 4 decimal places to tolerate minor floating-point jitter
+    components.push(
+      telemetry.audio.sampleSum.toFixed(4),
+      String(telemetry.audio.sampleRate),
+      String(telemetry.audio.channelCount)
+    );
+  }
+
+  if (telemetry.screen) {
+    components.push(
+      String(telemetry.screen.colorDepth),
+      telemetry.screen.pixelRatio.toFixed(2),
+      String(telemetry.screen.screenWidth),
+      String(telemetry.screen.screenHeight),
+      String(telemetry.screen.hasP3Gamut),
+      String(telemetry.screen.hasHDR)
+    );
+  }
+
+  return createHash("sha256").update(components.join("|")).digest("hex");
+}
+
+// ─── Gyroscope Analysis ───────────────────────────────────────────────────────
+
+/**
+ * Analyses gyroscope samples to produce a [0, 1] score.
+ *
+ * A high score indicates natural, human-like holding patterns (low
+ * micro-tremor noise consistent with a human hand).
+ * A near-zero score indicates impossible stillness (clamped device or
+ * synthetic data) or excessive noise (device on a moving surface).
+ */
+export function analyseGyroscope(samples: GyroscopeSample[]): number {
+  if (samples.length < GYRO_SIGNATURE_SAMPLES) {
+    // Insufficient data → neutral score
+    return 0.5;
+  }
+
+  const alphas = samples.map((s) => s.alpha);
+  const betas = samples.map((s) => s.beta);
+  const gammas = samples.map((s) => s.gamma);
+
+  const stdAlpha = stdDev(alphas);
+  const stdBeta = stdDev(betas);
+  const stdGamma = stdDev(gammas);
+  const avgStd = (stdAlpha + stdBeta + stdGamma) / 3;
+
+  // Perfect human tremor: ~0.5–5.0 deg/s std
+  // Too still: < 0.05 deg/s (clamp or synthetic)
+  // Too noisy: > GYRO_NOISE_THRESHOLD (motorised / synthetic)
+  if (avgStd < 0.05) return 0.1; // Suspiciously still
+  if (avgStd > GYRO_NOISE_THRESHOLD) return 0.1; // Suspiciously noisy
+
+  // Score peaks in the 0.5–5.0 range
+  const ideal = 2.5;
+  const distance = Math.abs(avgStd - ideal) / ideal;
+  return Math.max(0, 1 - distance);
+}
+
+// ─── Accelerometer Analysis ───────────────────────────────────────────────────
+
+/**
+ * Analyses accelerometer samples to produce a [0, 1] score.
+ *
+ * Each physical device has a characteristic noise floor (quantisation
+ * noise, sensor bias).  The noise floor is derived from the standard
+ * deviation of readings while the device is approximately stationary.
+ */
+export function analyseAccelerometer(samples: AccelerometerSample[]): number {
+  if (samples.length < 10) return 0.5;
+
+  const xs = samples.map((s) => s.x);
+  const ys = samples.map((s) => s.y);
+  const zs = samples.map((s) => s.z);
+
+  const noiseFloor = (stdDev(xs) + stdDev(ys) + stdDev(zs)) / 3;
+
+  // A legitimate mobile device at rest will have a noise floor of ~0.01–0.5 m/s².
+  // Values outside this band suggest synthetic or uncalibrated data.
+  if (noiseFloor < 0.005) return 0.15;
+  if (noiseFloor > 5.0) return 0.15;
+
+  return 0.9; // Plausible noise floor
+}
+
+// ─── WebGL Analysis ───────────────────────────────────────────────────────────
+
+/**
+ * Scores a WebGL fingerprint on [0, 1].
+ * Missing or clearly-spoofed GPU info reduces the score.
+ */
+export function analyseWebGL(fp: WebGLFingerprint | undefined): number {
+  if (!fp) return 0.3;
+
+  // Normalise for case-insensitive, whitespace-tolerant comparison to prevent
+  // trivial spoofing bypasses (e.g. 'Unknown', 'UNKNOWN', ' unknown ').
+  const renderer = fp.renderer.trim().toLowerCase();
+  const vendor = fp.vendor.trim().toLowerCase();
+
+  // Empty renderer or vendor strings indicate driver-level spoofing
+  if (!renderer || renderer === "unknown" || vendor === "unknown") {
+    return 0.2;
+  }
+
+  // Suspiciously small canvas hash (e.g., all-zero) is a signal of canvas
+  // fingerprint blocking/spoofing
+  if (!fp.canvasHash || /^0+$/.test(fp.canvasHash)) {
+    return 0.4;
+  }
+
+  // Reasonable GPU detected
+  return 0.95;
+}
+
+// ─── Audio Analysis ───────────────────────────────────────────────────────────
+
+/**
+ * Scores an audio fingerprint on [0, 1].
+ */
+export function analyseAudio(fp: AudioFingerprint | undefined): number {
+  if (!fp) return 0.3;
+
+  // sampleSum = 0 means the browser blocked audio context fingerprinting
+  if (fp.sampleSum === 0) return 0.3;
+
+  // Implausibly low or high sample rates are spoofing indicators
+  if (fp.sampleRate < 8_000 || fp.sampleRate > 192_000) return 0.2;
+
+  return 0.9;
+}
+
+// ─── Screen Analysis ──────────────────────────────────────────────────────────
+
+/**
+ * Scores a screen profile on [0, 1].
+ */
+export function analyseScreen(profile: ScreenProfile | undefined): number {
+  if (!profile) return 0.3;
+
+  // Non-standard colour depth (not 24/30/32) is unusual on real hardware
+  if (![24, 30, 32].includes(profile.colorDepth)) return 0.5;
+
+  // Pixel ratio of exactly 1 on a "mobile" device is suspicious
+  // (real phones almost always have ratio ≥ 2)
+  // Note: we don't have the platform flag here, so we score conservatively.
+  if (profile.pixelRatio <= 0) return 0.2;
+
+  return 0.9;
+}
+
+// ─── Device Enrolment ─────────────────────────────────────────────────────────
+
+/**
+ * Returns the enrolled devices for a user.
+ */
+export function getEnrolledDevices(userId: string): EnrolledDevice[] {
+  return enrolledDeviceStore.get(userId) ?? [];
+}
+
+/**
+ * Enrolls a device fingerprint for a user.
+ * If the device is already enrolled, updates its `lastSeenAt` timestamp.
+ * If `MAX_DEVICES_PER_USER` is reached, evicts the oldest device.
+ */
+export function enrollDevice(
+  userId: string,
+  deviceId: string,
+  platform: "mobile" | "desktop",
+  confidence: number
+): EnrolledDevice {
+  const devices = enrolledDeviceStore.get(userId) ?? [];
+  const existing = devices.find((d) => d.deviceId === deviceId);
+
+  if (existing) {
+    existing.lastSeenAt = new Date().toISOString();
+    enrolledDeviceStore.set(userId, devices);
+    return existing;
+  }
+
+  // Evict oldest if at capacity
+  if (devices.length >= MAX_DEVICES_PER_USER) {
+    devices.sort(
+      (a, b) =>
+        new Date(a.lastSeenAt).getTime() - new Date(b.lastSeenAt).getTime()
+    );
+    devices.shift();
+  }
+
+  const enrolled: EnrolledDevice = {
+    deviceId,
+    firstSeenAt: new Date().toISOString(),
+    lastSeenAt: new Date().toISOString(),
+    platform,
+    enrolledConfidence: confidence,
+  };
+  devices.push(enrolled);
+  enrolledDeviceStore.set(userId, devices);
+  return enrolled;
+}
+
+/**
+ * Removes a specific device from a user's enrolled device list.
+ */
+export function revokeDevice(userId: string, deviceId: string): boolean {
+  const devices = enrolledDeviceStore.get(userId) ?? [];
+  const before = devices.length;
+  const filtered = devices.filter((d) => d.deviceId !== deviceId);
+  enrolledDeviceStore.set(userId, filtered);
+  return filtered.length < before;
+}
+
+// ─── Confidence Scoring ───────────────────────────────────────────────────────
+
+/**
+ * Evaluates device telemetry against the stored profile for a user.
+ *
+ * Returns a DeviceAuthResult with:
+ *   - deviceId (stable hash of telemetry)
+ *   - isKnownDevice (found in user's enrolled devices list)
+ *   - confidence [0, 1]
+ *   - per-signal scores
+ *   - list of detected anomalies
+ */
+export function evaluateDeviceTelemetry(
+  userId: string,
+  telemetry: DeviceTelemetry
+): DeviceAuthResult {
+  const deviceId = computeDeviceId(telemetry);
+  const enrolledDevices = getEnrolledDevices(userId);
+  const isKnownDevice = enrolledDevices.some((d) => d.deviceId === deviceId);
+  const anomalies: string[] = [];
+
+  // ── Signal scores ─────────────────────────────────────────────────────────
+  let gyroScore = 0.5;
+  let accelScore = 0.5;
+
+  if (telemetry.platform === "mobile") {
+    if (telemetry.gyroSamples && telemetry.gyroSamples.length > 0) {
+      gyroScore = analyseGyroscope(telemetry.gyroSamples);
+      if (gyroScore < 0.3) anomalies.push("ABNORMAL_GYROSCOPE_PATTERN");
+    }
+    if (telemetry.accelSamples && telemetry.accelSamples.length > 0) {
+      accelScore = analyseAccelerometer(telemetry.accelSamples);
+      if (accelScore < 0.3) anomalies.push("ABNORMAL_ACCELEROMETER_NOISE");
+    }
+  }
+
+  const webglScore = analyseWebGL(telemetry.webgl);
+  if (webglScore < 0.4) anomalies.push("WEBGL_FINGERPRINT_SUSPICIOUS");
+
+  const audioScore = analyseAudio(telemetry.audio);
+  if (audioScore < 0.4) anomalies.push("AUDIO_FINGERPRINT_BLOCKED");
+
+  const screenScore = analyseScreen(telemetry.screen);
+  if (screenScore < 0.4) anomalies.push("SCREEN_PROFILE_ANOMALY");
+
+  if (!isKnownDevice && enrolledDevices.length >= MIN_ENROLLED_DEVICES) {
+    anomalies.push("UNKNOWN_DEVICE");
+  }
+
+  // ── Aggregate confidence ──────────────────────────────────────────────────
+  // Weight: known-device check counts for 30 %; sensor/fingerprint signals 70 %
+  const signalScore =
+    telemetry.platform === "mobile"
+      ? (gyroScore * 0.25 +
+          accelScore * 0.25 +
+          webglScore * 0.2 +
+          audioScore * 0.15 +
+          screenScore * 0.15)
+      : (webglScore * 0.4 + audioScore * 0.35 + screenScore * 0.25);
+
+  const deviceBonus = isKnownDevice ? 0.3 : 0;
+  const confidence = Math.min(1, signalScore * 0.7 + deviceBonus);
+
+  // Update last-seen for known device
+  if (isKnownDevice) {
+    const device = enrolledDevices.find((d) => d.deviceId === deviceId);
+    if (device) device.lastSeenAt = new Date().toISOString();
+  }
+
   return {
-    ...prev,
-    updatedAt: Date.now(),
-    sampleCount: prev.sampleCount + next.sampleCount,
-    gyroMagnitudeMean: ema(prev.gyroMagnitudeMean, next.gyroMagnitudeMean),
-    gyroMagnitudeStd: ema(prev.gyroMagnitudeStd, next.gyroMagnitudeStd),
-    accelNoiseFloor: ema(prev.accelNoiseFloor, next.accelNoiseFloor),
-    accelNoiseStd: ema(prev.accelNoiseStd, next.accelNoiseStd),
-    tiltBetaMean: ema(prev.tiltBetaMean, next.tiltBetaMean),
-    tiltGammaMean: ema(prev.tiltGammaMean, next.tiltGammaMean),
-    tiltBetaStd: ema(prev.tiltBetaStd, next.tiltBetaStd),
-    tiltGammaStd: ema(prev.tiltGammaStd, next.tiltGammaStd),
-    gravityMagnitudeMean: ema(prev.gravityMagnitudeMean, next.gravityMagnitudeMean),
-    webglVendorHash: next.webglVendorHash || prev.webglVendorHash,
-    webglRendererHash: next.webglRendererHash || prev.webglRendererHash,
-    webglExtensionsHash: next.webglExtensionsHash || prev.webglExtensionsHash,
-    audioOscillatorHash: next.audioOscillatorHash || prev.audioOscillatorHash,
-    audioSampleRate: next.audioSampleRate || prev.audioSampleRate,
-    fontHash: next.fontHash || prev.fontHash,
-    pluginHash: next.pluginHash || prev.pluginHash,
-    timezone: next.timezone || prev.timezone,
-    languageHash: next.languageHash || prev.languageHash,
-    screenHash: next.screenHash || prev.screenHash,
-    userAgentHash: next.userAgentHash || prev.userAgentHash,
+    userId,
+    deviceId,
+    isKnownDevice,
+    confidence,
+    signals: {
+      gyroScore,
+      accelScore,
+      webglScore,
+      audioScore,
+      screenScore,
+    },
+    anomalies,
+    evaluatedAt: new Date().toISOString(),
   };
 }
 
-// ─── Singleton + Fastify route plugin ────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-let _singleton: DeviceSensorAuth | null = null;
-
-export function getDeviceSensorAuth(): DeviceSensorAuth {
-  if (!_singleton) _singleton = new DeviceSensorAuth();
-  return _singleton;
+function mean(arr: number[]): number {
+  return arr.length === 0 ? 0 : arr.reduce((s, v) => s + v, 0) / arr.length;
 }
 
-export function setDeviceSensorAuth(svc: DeviceSensorAuth): void {
-  _singleton = svc;
+function stdDev(arr: number[]): number {
+  if (arr.length === 0) return 0;
+  const m = mean(arr);
+  const variance = arr.reduce((s, v) => s + (v - m) ** 2, 0) / arr.length;
+  return Math.sqrt(variance);
 }
-
-import type { FastifyInstance, FastifyPluginAsync, FastifyRequest } from "fastify";
-
-function extractUserId(request: FastifyRequest): string | null {
-  const r = request as FastifyRequest & {
-    user?: { id?: string };
-    zeroTrustUser?: { id?: string };
-  };
-  return r.user?.id ?? r.zeroTrustUser?.id ?? null;
-}
-
-export const deviceSensorRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
-  app.post("/device/enroll", async (request, reply) => {
-    const userId = extractUserId(request);
-    if (!userId) return reply.code(401).send({ error: "UNAUTHENTICATED" });
-    const parsed = validateBundle(request.body);
-    if (!parsed.ok) return reply.code(400).send({ error: parsed.error });
-    const sig = getDeviceSensorAuth().enroll(userId, parsed.value);
-    return reply.send({
-      enrolled: true,
-      deviceId: sig.deviceId,
-      deviceKind: sig.deviceKind,
-      updatedAt: sig.updatedAt,
-    });
-  });
-
-  app.post("/device/verify", async (request, reply) => {
-    const userId = extractUserId(request);
-    if (!userId) return reply.code(401).send({ error: "UNAUTHENTICATED" });
-    const parsed = validateBundle(request.body);
-    if (!parsed.ok) return reply.code(400).send({ error: parsed.error });
-    const cmp = getDeviceSensorAuth().compare(userId, parsed.value);
-    return reply.send(cmp);
-  });
-
-  app.get("/device/list", async (request, reply) => {
-    const userId = extractUserId(request);
-    if (!userId) return reply.code(401).send({ error: "UNAUTHENTICATED" });
-    const devices = getDeviceSensorAuth()
-      .listDevices(userId)
-      .map((d) => ({
-        deviceId: d.deviceId,
-        deviceKind: d.deviceKind,
-        sampleCount: d.sampleCount,
-        updatedAt: d.updatedAt,
-      }));
-    return reply.send({ devices });
-  });
-
-  app.delete("/device/:deviceId", async (request, reply) => {
-    const userId = extractUserId(request);
-    if (!userId) return reply.code(401).send({ error: "UNAUTHENTICATED" });
-    const params = request.params as { deviceId?: string };
-    if (!params.deviceId) return reply.code(400).send({ error: "MISSING_DEVICE_ID" });
-    const ok = getDeviceSensorAuth().removeDevice(userId, params.deviceId);
-    return reply.send({ removed: ok });
-  });
-};

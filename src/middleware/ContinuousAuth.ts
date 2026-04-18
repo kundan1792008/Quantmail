@@ -1,576 +1,416 @@
 /**
- * ContinuousAuthMiddleware
- * ========================
+ * ContinuousAuth Middleware
  *
- * The glue layer that aggregates signals from the three behavioral
- * biometric sensors into a single confidence score in [0, 1]:
+ * Aggregates identity signals from:
+ *   - TypingRhythmAnalyzer   (keystroke dynamics)
+ *   - MouseDynamicsTracker   (pointer behaviour)
+ *   - DeviceSensorAuth       (hardware fingerprint / sensors)
  *
- *   - {@link TypingRhythmAnalyzer}     (keystroke DTW)
- *   - {@link MouseDynamicsTracker}     (64-feature vector distance)
- *   - {@link DeviceSensorAuth}         (device fingerprint / motion)
+ * into a single [0, 1] confidence score per authenticated session.
  *
- * Decision rules (per issue #42):
- *   1. confidence < 0.7 for more than 60 s  →  soft re-auth (face scan)
- *   2. confidence < 0.3                      →  immediate hard lock +
- *                                              full biometric re-auth
- *   3. All state transitions are written to a per-process
- *      {@link SecurityAuditLog}.
+ * Enforcement rules:
+ *   - confidence < 0.7 sustained for > 60 seconds → soft re-auth (face scan)
+ *   - confidence < 0.3 at any point → immediate session lock + full biometric
+ *     re-auth required
  *
- * The middleware is a regular Fastify `preHandler`. It does NOT replace
- * upstream JWT / session middleware — it runs *after* authentication
- * has already happened and uses `request.user.id` as the subject.
+ * All anomaly events are written to the SecurityAuditLog table.
  *
- * Everything here is deterministic and has no external side effects
- * beyond the in-process audit log. Production deployments can swap
- * {@link InMemorySecurityAuditLog} for a Prisma-backed implementation.
+ * Fastify route registration exposes:
+ *   POST /behavioral/telemetry   – ingest a telemetry batch
+ *   GET  /behavioral/confidence  – read current confidence for the caller
+ *   POST /behavioral/clear       – clear anomaly state after re-auth
  */
 
-import type { FastifyInstance, FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
-
+import { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
+import { prisma } from "../db";
+import { zeroTrustGateway } from "./ZeroTrustGateway";
 import {
-  getTypingRhythmAnalyzer,
-  TypingRhythmAnalyzer,
-  TypingComparisonResult,
-  TypingAnomalyState,
+  ingestKeystrokes,
+  clearAnomalyState as clearTypingAnomaly,
+  KeystrokeEvent,
 } from "../services/TypingRhythmAnalyzer";
 import {
-  getMouseDynamicsTracker,
-  MouseDynamicsTracker,
-  MouseComparisonResult,
+  ingestMovementWindow,
+  MovementSample,
+  ClickEvent,
+  ScrollEvent,
+  HoverEvent,
 } from "../services/MouseDynamicsTracker";
 import {
-  getDeviceSensorAuth,
-  DeviceSensorAuth,
-  DeviceComparisonResult,
+  evaluateDeviceTelemetry,
+  enrollDevice,
+  getEnrolledDevices,
+  DeviceTelemetry,
 } from "../services/DeviceSensorAuth";
 
-// ─── Public Types ────────────────────────────────────────────────────────────
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-/** Aggregated confidence snapshot for a user. */
-export interface ContinuousAuthSnapshot {
-  readonly userId: string;
-  readonly confidence: number; // 0..1
-  readonly state: ContinuousAuthState;
-  readonly typing: {
-    readonly score: number;
-    readonly comparison: TypingComparisonResult | null;
-    readonly anomaly: TypingAnomalyState;
-  };
-  readonly mouse: {
-    readonly score: number;
-    readonly comparison: MouseComparisonResult | null;
-  };
-  readonly device: {
-    readonly score: number;
-    readonly comparison: DeviceComparisonResult | null;
-  };
-  readonly lastUpdatedAt: number;
-  readonly belowSoftSince: number | null;
-  readonly belowHardSince: number | null;
-  readonly reauthRequired: ReauthLevel;
-}
+/** Confidence below which a soft re-auth is triggered (after grace period). */
+const SOFT_REAUTH_THRESHOLD = 0.7;
 
-export type ContinuousAuthState =
-  | "OK"
-  | "WATCHING" // below soft threshold, but not yet for the full dwell
-  | "SOFT_REAUTH" // soft dwell tripped — needs face scan
-  | "HARD_LOCK"; // hard threshold tripped — full biometric lockdown
+/** Confidence below which the session is locked immediately. */
+const HARD_LOCK_THRESHOLD = 0.3;
 
-export type ReauthLevel = "NONE" | "SOFT" | "HARD";
+/** Milliseconds of sub-threshold confidence before triggering soft re-auth. */
+const SOFT_REAUTH_GRACE_MS = 60_000;
 
-/** A single row in the security audit log. */
-export interface SecurityAuditEntry {
-  readonly id: string;
-  readonly userId: string;
-  readonly at: number;
-  readonly event: string;
-  readonly confidence: number;
-  readonly state: ContinuousAuthState;
-  readonly details: Record<string, unknown>;
-}
+/** Signal weights for the composite confidence score. */
+const WEIGHTS = {
+  typing: 0.35,
+  mouse: 0.35,
+  device: 0.30,
+} as const;
 
-export interface SecurityAuditLog {
-  record(entry: Omit<SecurityAuditEntry, "id" | "at"> & { at?: number }): SecurityAuditEntry;
-  list(userId: string, limit?: number): readonly SecurityAuditEntry[];
-  all(limit?: number): readonly SecurityAuditEntry[];
-  clear(userId?: string): void;
-}
+/**
+ * Maximum number of devices that will be auto-enrolled on first recognition.
+ * Kept intentionally small to limit the attack surface of silent enrolment.
+ */
+const AUTO_ENROLL_DEVICE_LIMIT = 3;
 
-// ─── Constants ───────────────────────────────────────────────────────────────
+// ─── In-memory session confidence state ──────────────────────────────────────
 
-export const ContinuousAuthConstants = Object.freeze({
-  SOFT_THRESHOLD: 0.7,
-  HARD_THRESHOLD: 0.3,
-  SOFT_DWELL_MS: 60_000,
-  AUDIT_MAX_ENTRIES: 2_000,
-
-  /** Weights applied when combining per-channel scores. */
-  WEIGHTS: Object.freeze({
-    typing: 0.4,
-    mouse: 0.35,
-    device: 0.25,
-  }),
-
-  /** Routes that must bypass the middleware (public endpoints). */
-  DEFAULT_BYPASS_PREFIXES: Object.freeze([
-    "/auth",
-    "/health",
-    "/docs",
-    "/liveness",
-    "/landing",
-    "/",
-  ]),
-} as const);
-
-// ─── Security Audit Log ──────────────────────────────────────────────────────
-
-export class InMemorySecurityAuditLog implements SecurityAuditLog {
-  private readonly entries: SecurityAuditEntry[] = [];
-  private counter = 0;
-
-  record(
-    entry: Omit<SecurityAuditEntry, "id" | "at"> & { at?: number }
-  ): SecurityAuditEntry {
-    this.counter += 1;
-    const full: SecurityAuditEntry = {
-      id: `audit-${Date.now()}-${this.counter}`,
-      at: entry.at ?? Date.now(),
-      userId: entry.userId,
-      event: entry.event,
-      confidence: entry.confidence,
-      state: entry.state,
-      details: entry.details,
-    };
-    this.entries.push(full);
-    if (this.entries.length > ContinuousAuthConstants.AUDIT_MAX_ENTRIES) {
-      this.entries.splice(
-        0,
-        this.entries.length - ContinuousAuthConstants.AUDIT_MAX_ENTRIES
-      );
-    }
-    return full;
-  }
-
-  list(userId: string, limit = 100): readonly SecurityAuditEntry[] {
-    const filtered = this.entries.filter((e) => e.userId === userId);
-    return filtered.slice(Math.max(0, filtered.length - limit));
-  }
-
-  all(limit = 200): readonly SecurityAuditEntry[] {
-    return this.entries.slice(Math.max(0, this.entries.length - limit));
-  }
-
-  clear(userId?: string): void {
-    if (!userId) {
-      this.entries.length = 0;
-      return;
-    }
-    for (let i = this.entries.length - 1; i >= 0; i -= 1) {
-      if (this.entries[i]!.userId === userId) this.entries.splice(i, 1);
-    }
-  }
-}
-
-// ─── State Machine ───────────────────────────────────────────────────────────
-
-interface UserRuntimeState {
+interface SessionState {
   userId: string;
-  confidence: number;
-  state: ContinuousAuthState;
-  belowSoftSince: number | null;
-  belowHardSince: number | null;
+  typingConfidence: number;
+  mouseConfidence: number;
+  deviceConfidence: number;
+  compositeConfidence: number;
+  locked: boolean;
+  softReauthRequired: boolean;
+  lowConfidenceSince: number | null;
   lastUpdatedAt: number;
-  reauthRequired: ReauthLevel;
-  typingScore: number;
-  mouseScore: number;
-  deviceScore: number;
 }
 
-function freshRuntime(userId: string): UserRuntimeState {
-  return {
-    userId,
-    confidence: 1,
-    state: "OK",
-    belowSoftSince: null,
-    belowHardSince: null,
-    lastUpdatedAt: 0,
-    reauthRequired: "NONE",
-    typingScore: 1,
-    mouseScore: 1,
-    deviceScore: 1,
-  };
+const sessionStateStore = new Map<string, SessionState>();
+
+// ─── Confidence Calculation ───────────────────────────────────────────────────
+
+/**
+ * Computes the weighted composite confidence score.
+ */
+export function computeCompositeConfidence(
+  typingConfidence: number,
+  mouseConfidence: number,
+  deviceConfidence: number
+): number {
+  return (
+    typingConfidence * WEIGHTS.typing +
+    mouseConfidence * WEIGHTS.mouse +
+    deviceConfidence * WEIGHTS.device
+  );
 }
 
-// ─── Aggregator ──────────────────────────────────────────────────────────────
+// ─── Session State Management ─────────────────────────────────────────────────
 
-export interface ContinuousAuthDeps {
-  readonly typing: TypingRhythmAnalyzer;
-  readonly mouse: MouseDynamicsTracker;
-  readonly device: DeviceSensorAuth;
-  readonly audit: SecurityAuditLog;
-  readonly now?: () => number;
+/**
+ * Returns (or creates) the in-memory session state for a user.
+ */
+export function getSessionState(userId: string): SessionState {
+  if (!sessionStateStore.has(userId)) {
+    sessionStateStore.set(userId, {
+      userId,
+      typingConfidence: 0.8,
+      mouseConfidence: 0.8,
+      deviceConfidence: 0.8,
+      compositeConfidence: 0.8,
+      locked: false,
+      softReauthRequired: false,
+      lowConfidenceSince: null,
+      lastUpdatedAt: Date.now(),
+    });
+  }
+  return sessionStateStore.get(userId)!;
 }
 
-export class ContinuousAuthService {
-  private readonly typing: TypingRhythmAnalyzer;
-  private readonly mouse: MouseDynamicsTracker;
-  private readonly device: DeviceSensorAuth;
-  private readonly audit: SecurityAuditLog;
-  private readonly runtime = new Map<string, UserRuntimeState>();
-  private readonly now: () => number;
+/**
+ * Updates the session state with new signal values and applies the enforcement
+ * rules.  Returns the updated state.
+ */
+export function updateSessionState(
+  userId: string,
+  partial: Partial<Pick<SessionState, "typingConfidence" | "mouseConfidence" | "deviceConfidence">>
+): SessionState {
+  const state = getSessionState(userId);
+  const now = Date.now();
 
-  constructor(deps?: Partial<ContinuousAuthDeps>) {
-    this.typing = deps?.typing ?? getTypingRhythmAnalyzer();
-    this.mouse = deps?.mouse ?? getMouseDynamicsTracker();
-    this.device = deps?.device ?? getDeviceSensorAuth();
-    this.audit = deps?.audit ?? new InMemorySecurityAuditLog();
-    this.now = deps?.now ?? Date.now;
+  if (partial.typingConfidence !== undefined)
+    state.typingConfidence = partial.typingConfidence;
+  if (partial.mouseConfidence !== undefined)
+    state.mouseConfidence = partial.mouseConfidence;
+  if (partial.deviceConfidence !== undefined)
+    state.deviceConfidence = partial.deviceConfidence;
+
+  state.compositeConfidence = computeCompositeConfidence(
+    state.typingConfidence,
+    state.mouseConfidence,
+    state.deviceConfidence
+  );
+  state.lastUpdatedAt = now;
+
+  // ── Enforcement rules ────────────────────────────────────────────────────
+
+  // Rule 1: immediate lock on critically low confidence
+  if (state.compositeConfidence < HARD_LOCK_THRESHOLD) {
+    state.locked = true;
+    state.softReauthRequired = false;
   }
 
-  /**
-   * Recompute the aggregate confidence for `userId` and return a fresh
-   * snapshot. This method is idempotent and has no side effects other
-   * than potentially appending one audit entry when the state changes.
-   */
-  evaluate(userId: string): ContinuousAuthSnapshot {
-    const runtime = this.runtime.get(userId) ?? freshRuntime(userId);
-
-    const typingCmp = this.safeTypingCompare(userId);
-    const mouseCmp = this.safeMouseCompare(userId);
-    const deviceLast = this.device.lastResult(userId);
-
-    const typingScore = clamp01(typingCmp?.score ?? this.typing.score(userId));
-    const mouseScore = clamp01(mouseCmp?.score ?? this.mouse.score(userId));
-    const deviceScore = clamp01(this.device.score(userId));
-
-    const W = ContinuousAuthConstants.WEIGHTS;
-    const confidence = clamp01(
-      typingScore * W.typing + mouseScore * W.mouse + deviceScore * W.device
-    );
-
-    const prevState = runtime.state;
-    const nowMs = this.now();
-
-    // Update dwell timers.
-    if (confidence < ContinuousAuthConstants.SOFT_THRESHOLD) {
-      if (runtime.belowSoftSince == null) runtime.belowSoftSince = nowMs;
-    } else {
-      runtime.belowSoftSince = null;
+  // Rule 2: soft re-auth after sustained low confidence
+  if (!state.locked && state.compositeConfidence < SOFT_REAUTH_THRESHOLD) {
+    if (state.lowConfidenceSince === null) {
+      state.lowConfidenceSince = now;
+    } else if (now - state.lowConfidenceSince >= SOFT_REAUTH_GRACE_MS) {
+      state.softReauthRequired = true;
     }
-    if (confidence < ContinuousAuthConstants.HARD_THRESHOLD) {
-      if (runtime.belowHardSince == null) runtime.belowHardSince = nowMs;
-    } else {
-      runtime.belowHardSince = null;
-    }
+  } else if (state.compositeConfidence >= SOFT_REAUTH_THRESHOLD) {
+    // Confidence recovered – reset the grace-period timer
+    state.lowConfidenceSince = null;
+  }
 
-    // Decide state.
-    let nextState: ContinuousAuthState = "OK";
-    let reauth: ReauthLevel = "NONE";
-    if (confidence < ContinuousAuthConstants.HARD_THRESHOLD) {
-      nextState = "HARD_LOCK";
-      reauth = "HARD";
-    } else if (
-      runtime.belowSoftSince != null &&
-      nowMs - runtime.belowSoftSince >= ContinuousAuthConstants.SOFT_DWELL_MS
-    ) {
-      nextState = "SOFT_REAUTH";
-      reauth = "SOFT";
-    } else if (confidence < ContinuousAuthConstants.SOFT_THRESHOLD) {
-      nextState = "WATCHING";
-      reauth = "NONE";
-    }
+  return state;
+}
 
-    runtime.confidence = confidence;
-    runtime.state = nextState;
-    runtime.reauthRequired = reauth;
-    runtime.lastUpdatedAt = nowMs;
-    runtime.typingScore = typingScore;
-    runtime.mouseScore = mouseScore;
-    runtime.deviceScore = deviceScore;
-    this.runtime.set(userId, runtime);
+/**
+ * Clears anomaly/lock state for a user after successful re-authentication.
+ */
+export function clearSessionLock(userId: string): void {
+  const state = getSessionState(userId);
+  state.locked = false;
+  state.softReauthRequired = false;
+  state.lowConfidenceSince = null;
+  clearTypingAnomaly(userId);
+}
 
-    // Audit state transitions.
-    if (prevState !== nextState) {
-      this.audit.record({
+// ─── Audit Logging ────────────────────────────────────────────────────────────
+
+/**
+ * Writes an anomaly event to the SecurityAuditLog.
+ * Silently swallows database errors to avoid blocking the auth pipeline.
+ */
+async function logAnomalyEvent(
+  userId: string,
+  eventType: string,
+  details: Record<string, unknown>
+): Promise<void> {
+  try {
+    // The SecurityAuditLog model is new and the Prisma client types are
+    // regenerated during `npm run build` (prisma generate).  Until then the
+    // cast below is the minimal safe workaround; it will be removed once the
+    // generated client reflects the updated schema.
+    await (prisma as unknown as {
+      securityAuditLog: {
+        create: (args: { data: Record<string, unknown> }) => Promise<unknown>;
+      };
+    }).securityAuditLog.create({
+      data: {
         userId,
-        event: `STATE_${prevState}_TO_${nextState}`,
-        confidence,
-        state: nextState,
-        details: {
-          typing: typingScore,
-          mouse: mouseScore,
-          device: deviceScore,
-          soft: runtime.belowSoftSince,
-          hard: runtime.belowHardSince,
-        },
-      });
-    }
-
-    return {
-      userId,
-      confidence,
-      state: nextState,
-      typing: {
-        score: typingScore,
-        comparison: typingCmp,
-        anomaly: this.typing.anomalyState(userId),
+        eventType,
+        details: JSON.stringify(details),
+        occurredAt: new Date(),
       },
-      mouse: { score: mouseScore, comparison: mouseCmp },
-      device: { score: deviceScore, comparison: deviceLast },
-      lastUpdatedAt: nowMs,
-      belowSoftSince: runtime.belowSoftSince,
-      belowHardSince: runtime.belowHardSince,
-      reauthRequired: reauth,
-    };
-  }
-
-  /** Explicit reset — called after a successful full re-auth. */
-  clear(userId: string): void {
-    this.runtime.delete(userId);
-    this.typing.resetLiveBuffer(userId);
-    this.mouse.resetLiveBuffer(userId);
-    this.audit.record({
-      userId,
-      event: "CLEARED_BY_REAUTH",
-      confidence: 1,
-      state: "OK",
-      details: {},
     });
-  }
-
-  /** Explicit soft-clear — used after a successful face scan. */
-  acknowledgeSoftReauth(userId: string): void {
-    const runtime = this.runtime.get(userId);
-    if (!runtime) return;
-    runtime.belowSoftSince = null;
-    runtime.state = "OK";
-    runtime.reauthRequired = "NONE";
-    runtime.confidence = Math.max(runtime.confidence, 0.8);
-    this.runtime.set(userId, runtime);
-    this.audit.record({
-      userId,
-      event: "SOFT_REAUTH_ACK",
-      confidence: runtime.confidence,
-      state: "OK",
-      details: {},
-    });
-  }
-
-  auditLog(): SecurityAuditLog {
-    return this.audit;
-  }
-
-  /**
-   * Returns the most recent snapshot without re-evaluating. Useful from
-   * hot paths that already called `evaluate` earlier in the same
-   * request lifecycle.
-   */
-  snapshot(userId: string): ContinuousAuthSnapshot {
-    const rt = this.runtime.get(userId);
-    if (!rt) return this.evaluate(userId);
-    return {
-      userId,
-      confidence: rt.confidence,
-      state: rt.state,
-      typing: {
-        score: rt.typingScore,
-        comparison: null,
-        anomaly: this.typing.anomalyState(userId),
-      },
-      mouse: { score: rt.mouseScore, comparison: null },
-      device: { score: rt.deviceScore, comparison: this.device.lastResult(userId) },
-      lastUpdatedAt: rt.lastUpdatedAt,
-      belowSoftSince: rt.belowSoftSince,
-      belowHardSince: rt.belowHardSince,
-      reauthRequired: rt.reauthRequired,
-    };
-  }
-
-  private safeTypingCompare(userId: string): TypingComparisonResult | null {
-    try {
-      return this.typing.compare(userId);
-    } catch {
-      return null;
-    }
-  }
-
-  private safeMouseCompare(userId: string): MouseComparisonResult | null {
-    try {
-      return this.mouse.compare(userId);
-    } catch {
-      return null;
-    }
+  } catch {
+    // Non-fatal: log to stderr only
+    console.error(`[ContinuousAuth] Failed to write audit log for ${userId}:`, eventType);
   }
 }
 
-// ─── Singleton ───────────────────────────────────────────────────────────────
+// ─── Telemetry Ingestion ──────────────────────────────────────────────────────
 
-let _singleton: ContinuousAuthService | null = null;
-
-export function getContinuousAuthService(): ContinuousAuthService {
-  if (!_singleton) _singleton = new ContinuousAuthService();
-  return _singleton;
-}
-
-export function setContinuousAuthService(svc: ContinuousAuthService): void {
-  _singleton = svc;
-}
-
-function clamp01(v: number): number {
-  if (!Number.isFinite(v)) return 0;
-  if (v < 0) return 0;
-  if (v > 1) return 1;
-  return v;
-}
-
-// ─── Middleware ──────────────────────────────────────────────────────────────
-
-export interface ContinuousAuthMiddlewareOptions {
-  readonly bypassPrefixes?: readonly string[];
-  readonly service?: ContinuousAuthService;
-  readonly onSoftReauth?: (snap: ContinuousAuthSnapshot, request: FastifyRequest) => void;
-  readonly onHardLock?: (snap: ContinuousAuthSnapshot, request: FastifyRequest) => void;
-}
-
-declare module "fastify" {
-  interface FastifyRequest {
-    continuousAuth?: ContinuousAuthSnapshot;
-  }
-}
-
-function extractUserId(request: FastifyRequest): string | null {
-  const r = request as FastifyRequest & {
-    user?: { id?: string };
-    zeroTrustUser?: { id?: string };
-  };
-  return r.user?.id ?? r.zeroTrustUser?.id ?? null;
-}
-
-function shouldBypass(
-  url: string | undefined,
-  bypass: readonly string[]
-): boolean {
-  if (!url) return true;
-  for (let i = 0; i < bypass.length; i += 1) {
-    const p = bypass[i]!;
-    // Exact "/" bypass only applies to the literal root path.
-    if (p === "/") {
-      if (url === "/") return true;
-      continue;
-    }
-    if (url === p || url.startsWith(p + "/") || url.startsWith(p + "?")) return true;
-  }
-  return false;
+/** Shape of the POST /behavioral/telemetry request body. */
+interface TelemetryBody {
+  keystrokes?: KeystrokeEvent[];
+  movements?: MovementSample[];
+  clicks?: ClickEvent[];
+  scrolls?: ScrollEvent[];
+  hovers?: HoverEvent[];
+  device?: DeviceTelemetry;
 }
 
 /**
- * Build a Fastify `preHandler` that attaches the latest
- * {@link ContinuousAuthSnapshot} to `request.continuousAuth` and, when
- * the state has escalated, short-circuits the response with either
- * `401 SOFT_REAUTH` (face scan required) or `401 HARD_LOCK`
- * (full biometric re-auth required).
- */
-export function buildContinuousAuthMiddleware(
-  options: ContinuousAuthMiddlewareOptions = {}
-): (request: FastifyRequest, reply: FastifyReply) => Promise<void> {
-  const bypass = options.bypassPrefixes ?? ContinuousAuthConstants.DEFAULT_BYPASS_PREFIXES;
-  const svc = options.service ?? getContinuousAuthService();
-
-  return async function continuousAuthPreHandler(
-    request: FastifyRequest,
-    reply: FastifyReply
-  ): Promise<void> {
-    if (shouldBypass(request.url, bypass)) return;
-    const userId = extractUserId(request);
-    if (!userId) return; // unauthenticated routes are handled by upstream auth
-
-    const snap = svc.evaluate(userId);
-    request.continuousAuth = snap;
-    reply.header("X-Continuous-Auth-Confidence", snap.confidence.toFixed(3));
-    reply.header("X-Continuous-Auth-State", snap.state);
-
-    if (snap.state === "HARD_LOCK") {
-      if (options.onHardLock) {
-        try {
-          options.onHardLock(snap, request);
-        } catch {
-          // ignore callback failures
-        }
-      }
-      return reply.code(401).send({
-        error: "HARD_LOCK",
-        message: "Session locked — full biometric re-authentication required.",
-        confidence: snap.confidence,
-      });
-    }
-
-    if (snap.state === "SOFT_REAUTH") {
-      if (options.onSoftReauth) {
-        try {
-          options.onSoftReauth(snap, request);
-        } catch {
-          // ignore callback failures
-        }
-      }
-      return reply.code(401).send({
-        error: "SOFT_REAUTH",
-        message: "Face re-scan required to continue.",
-        confidence: snap.confidence,
-      });
-    }
-  };
-}
-
-// ─── Fastify plugin ──────────────────────────────────────────────────────────
-
-/**
- * Fastify plugin that registers the middleware globally and exposes
- * introspection endpoints:
+ * Processes a single telemetry batch for a user, updates the session state,
+ * and enforces re-auth if needed.
  *
- *   GET  /continuous-auth/snapshot   → current confidence snapshot
- *   GET  /continuous-auth/audit      → security audit log for user
- *   POST /continuous-auth/reauth/ack → acknowledge completed face scan
- *   POST /continuous-auth/reset      → acknowledge completed full re-auth
+ * Returns the updated SessionState.
  */
-export const continuousAuthRoutes: FastifyPluginAsync<ContinuousAuthMiddlewareOptions> =
-  async (app: FastifyInstance, opts: ContinuousAuthMiddlewareOptions = {}) => {
-    const svc = opts.service ?? getContinuousAuthService();
-    const preHandler = buildContinuousAuthMiddleware(opts);
-    app.addHook("preHandler", preHandler);
+export async function processTelemetry(
+  userId: string,
+  body: TelemetryBody
+): Promise<SessionState> {
+  const updates: Partial<Pick<SessionState, "typingConfidence" | "mouseConfidence" | "deviceConfidence">> = {};
 
-    app.get("/continuous-auth/snapshot", async (request, reply) => {
-      const userId = extractUserId(request);
-      if (!userId) return reply.code(401).send({ error: "UNAUTHENTICATED" });
-      return reply.send(svc.evaluate(userId));
+  // ── Typing ────────────────────────────────────────────────────────────────
+  if (body.keystrokes && body.keystrokes.length > 0) {
+    const typingResult = ingestKeystrokes(userId, body.keystrokes);
+    if (typingResult) {
+      updates.typingConfidence = typingResult.confidence;
+      if (typingResult.isAnomaly) {
+        await logAnomalyEvent(userId, "TYPING_ANOMALY_DETECTED", {
+          dtwDistance: typingResult.dtwDistance,
+          windowSize: typingResult.windowSize,
+        });
+      }
+    }
+  }
+
+  // ── Mouse ─────────────────────────────────────────────────────────────────
+  if (body.movements && body.movements.length > 0) {
+    const mouseResult = ingestMovementWindow(
+      userId,
+      body.movements,
+      body.clicks ?? [],
+      body.scrolls ?? [],
+      body.hovers ?? []
+    );
+    if (mouseResult) {
+      updates.mouseConfidence = mouseResult.confidence;
+      if (mouseResult.isAnomaly) {
+        await logAnomalyEvent(userId, "MOUSE_ANOMALY_DETECTED", {
+          cosineSimilarity: mouseResult.cosineSimilarity,
+          impossibleMovements: mouseResult.impossibleMovements,
+        });
+      }
+    }
+  }
+
+  // ── Device ────────────────────────────────────────────────────────────────
+  if (body.device) {
+    const deviceResult = evaluateDeviceTelemetry(userId, body.device);
+    updates.deviceConfidence = deviceResult.confidence;
+
+    // Auto-enroll device on first recognition (below max limit)
+    if (!deviceResult.isKnownDevice) {
+      const enrolled = getEnrolledDevices(userId);
+      if (enrolled.length < AUTO_ENROLL_DEVICE_LIMIT) {
+        enrollDevice(
+          userId,
+          deviceResult.deviceId,
+          body.device.platform,
+          deviceResult.confidence
+        );
+      }
+    }
+
+    if (deviceResult.anomalies.length > 0) {
+      await logAnomalyEvent(userId, "DEVICE_ANOMALY_DETECTED", {
+        deviceId: deviceResult.deviceId,
+        anomalies: deviceResult.anomalies,
+      });
+    }
+  }
+
+  const state = updateSessionState(userId, updates);
+
+  // ── Lock logging ──────────────────────────────────────────────────────────
+  if (state.locked) {
+    await logAnomalyEvent(userId, "SESSION_LOCKED", {
+      compositeConfidence: state.compositeConfidence,
+      typingConfidence: state.typingConfidence,
+      mouseConfidence: state.mouseConfidence,
+      deviceConfidence: state.deviceConfidence,
     });
-
-    app.get("/continuous-auth/audit", async (request, reply) => {
-      const userId = extractUserId(request);
-      if (!userId) return reply.code(401).send({ error: "UNAUTHENTICATED" });
-      const limit = Number((request.query as { limit?: string })?.limit) || 100;
-      return reply.send({ entries: svc.auditLog().list(userId, limit) });
+  } else if (state.softReauthRequired) {
+    await logAnomalyEvent(userId, "SOFT_REAUTH_REQUIRED", {
+      compositeConfidence: state.compositeConfidence,
+      lowConfidenceDurationMs: state.lowConfidenceSince
+        ? Date.now() - state.lowConfidenceSince
+        : 0,
     });
+  }
 
-    app.post("/continuous-auth/reauth/ack", async (request, reply) => {
-      const userId = extractUserId(request);
-      if (!userId) return reply.code(401).send({ error: "UNAUTHENTICATED" });
-      svc.acknowledgeSoftReauth(userId);
-      return reply.send({ ok: true });
-    });
+  return state;
+}
 
-    app.post("/continuous-auth/reset", async (request, reply) => {
-      const userId = extractUserId(request);
-      if (!userId) return reply.code(401).send({ error: "UNAUTHENTICATED" });
-      svc.clear(userId);
-      return reply.send({ ok: true });
-    });
-  };
+// ─── Fastify Route Registration ───────────────────────────────────────────────
 
-// ─── Helper: combine with ingest routes ──────────────────────────────────────
-//
-// Convenience re-exports so callers can wire everything up with a single
-// import.
+/**
+ * Registers all behavioral-biometrics routes on the Fastify instance.
+ *
+ * Routes:
+ *   POST /behavioral/telemetry   – ingest a telemetry batch
+ *   GET  /behavioral/confidence  – return current confidence for the caller
+ *   POST /behavioral/clear       – clear lock/anomaly state after re-auth
+ *   GET  /behavioral/devices     – list enrolled devices for the caller
+ */
+export async function continuousAuthRoutes(app: FastifyInstance): Promise<void> {
+  // ── POST /behavioral/telemetry ───────────────────────────────────────────
+  app.post(
+    "/behavioral/telemetry",
+    { preHandler: zeroTrustGateway },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const user = request.zeroTrustUser!;
+      const body = request.body as TelemetryBody;
 
-export { typingRhythmRoutes } from "../services/TypingRhythmAnalyzer";
-export { mouseDynamicsRoutes } from "../services/MouseDynamicsTracker";
-export { deviceSensorRoutes } from "../services/DeviceSensorAuth";
+      const state = await processTelemetry(user.id, body);
+
+      const status = state.locked
+        ? "LOCKED"
+        : state.softReauthRequired
+        ? "SOFT_REAUTH_REQUIRED"
+        : "OK";
+
+      return reply.code(state.locked ? 403 : 200).send({
+        status,
+        confidence: state.compositeConfidence,
+        signals: {
+          typing: state.typingConfidence,
+          mouse: state.mouseConfidence,
+          device: state.deviceConfidence,
+        },
+        locked: state.locked,
+        softReauthRequired: state.softReauthRequired,
+      });
+    }
+  );
+
+  // ── GET /behavioral/confidence ───────────────────────────────────────────
+  app.get(
+    "/behavioral/confidence",
+    { preHandler: zeroTrustGateway },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const user = request.zeroTrustUser!;
+      const state = getSessionState(user.id);
+
+      return reply.send({
+        userId: user.id,
+        confidence: state.compositeConfidence,
+        signals: {
+          typing: state.typingConfidence,
+          mouse: state.mouseConfidence,
+          device: state.deviceConfidence,
+        },
+        locked: state.locked,
+        softReauthRequired: state.softReauthRequired,
+        lastUpdatedAt: new Date(state.lastUpdatedAt).toISOString(),
+      });
+    }
+  );
+
+  // ── POST /behavioral/clear ───────────────────────────────────────────────
+  app.post(
+    "/behavioral/clear",
+    { preHandler: zeroTrustGateway },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const user = request.zeroTrustUser!;
+      clearSessionLock(user.id);
+
+      await logAnomalyEvent(user.id, "SESSION_LOCK_CLEARED", {
+        clearedBy: user.id,
+      });
+
+      return reply.send({ status: "OK", message: "Session lock cleared" });
+    }
+  );
+
+  // ── GET /behavioral/devices ──────────────────────────────────────────────
+  app.get(
+    "/behavioral/devices",
+    { preHandler: zeroTrustGateway },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const user = request.zeroTrustUser!;
+      const devices = getEnrolledDevices(user.id);
+
+      return reply.send({ devices });
+    }
+  );
+}
