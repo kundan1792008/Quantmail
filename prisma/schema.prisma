@@ -45,7 +45,6 @@ model User {
 
   livenessGrid              LivenessGrid?
   digitalTwin               DigitalTwin?
-  webAuthnCredentials       WebAuthnCredential[]
   sessions                  UserSession[]
   inboxMessages             InboxMessage[]
   saccadeSessions           SaccadeSession[]
@@ -71,6 +70,9 @@ model User {
   biometricHashes           BiometricHash[]
   webAuthnChallenges        WebAuthnChallenge[]
   webAuthnCredentials       WebAuthnCredential[]
+  ephemeralMessagesSent     EphemeralMessage[]   @relation("EphemeralMessagesSent")
+  keyExchangePairs          KeyExchangePair[]    @relation("KeyExchangePairs")
+  vaultedMessages           VaultedMessage[]     @relation("VaultedMessages")
 }
 
 // ─── AI / BYOK Settings ──────────────────────────────────────────
@@ -138,25 +140,6 @@ model WebAuthnChallenge {
   @@index([expiresAt])
 }
 
-model WebAuthnCredential {
-  id             String   @id @default(uuid())
-  userId         String
-  credentialId   String   @unique
-  publicKey      Bytes
-  counter        Int      @default(0)
-  transports     String   @default("[]")
-  deviceType     String   @default("singleDevice")
-  backedUp       Boolean  @default(false)
-  credentialType String   @default("public-key")
-  lastUsedAt     DateTime?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-
-  user User @relation(fields: [userId], references: [id])
-
-  @@index([userId, createdAt])
-}
-
 model DigitalTwin {
   id          String   @id @default(uuid())
   userId      String   @unique
@@ -191,6 +174,144 @@ model ShadowInbox {
   domain         String
   reason         String   @default("UNVERIFIED_DOMAIN")
   droppedAt      DateTime @default(now())
+}
+
+// ─── Self-Destructing Encrypted Messages (Issue #45) ─────────────
+
+enum EphemeralDestructionMode {
+  READ_ONCE
+  TIMER_1H
+  TIMER_24H
+  TIMER_7D
+  SCREENSHOT_PROOF
+}
+
+enum EphemeralMessageState {
+  ACTIVE
+  READ
+  EXPIRED
+  DESTROYED
+  REVOKED
+}
+
+enum KeyExchangeAlgorithm {
+  ECDH_P256
+  ECDH_P384
+}
+
+enum KeyExchangePairState {
+  ACTIVE
+  ROTATED
+  REVOKED
+}
+
+/// Encrypted, self-destructing message.
+///
+/// The server only ever stores opaque ciphertext + AEAD metadata.  The
+/// symmetric AES-256-GCM key is generated client-side and embedded in the
+/// recipient's URL fragment, so the server cannot decrypt the body.  When the
+/// destruction condition is met (single read, timer expiry, or explicit
+/// revocation) the ciphertext column is overwritten with random bytes and the
+/// row is hard-deleted by `EphemeralMailService.purgeDestroyed`.
+model EphemeralMessage {
+  id                  String                   @id @default(uuid())
+  senderUserId        String
+  recipientEmail      String
+  subject             String
+  ciphertext          String
+  iv                  String
+  authTag             String
+  algorithm           String                   @default("AES-256-GCM")
+  destructionMode     EphemeralDestructionMode
+  state               EphemeralMessageState    @default(ACTIVE)
+  expiresAt           DateTime?
+  maxReads            Int                      @default(1)
+  readCount           Int                      @default(0)
+  senderEphemeralKey  String?
+  keyExchangePairId   String?
+  vaultAllowed        Boolean                  @default(false)
+  attachmentsBlob     String?
+  attachmentsIv       String?
+  attachmentsAuthTag  String?
+  createdAt           DateTime                 @default(now())
+  destroyedAt         DateTime?
+  destructionReason   String?
+
+  sender       User                        @relation("EphemeralMessagesSent", fields: [senderUserId], references: [id], onDelete: Cascade)
+  keyExchange  KeyExchangePair?            @relation(fields: [keyExchangePairId], references: [id])
+  deliveries   EphemeralMessageDelivery[]
+
+  @@index([senderUserId, createdAt])
+  @@index([recipientEmail, state])
+  @@index([state, expiresAt])
+}
+
+/// Audit / access record for each open attempt of an EphemeralMessage.
+/// Used to enforce READ_ONCE semantics atomically and to surface a
+/// tamper-evident access log to the sender.
+model EphemeralMessageDelivery {
+  id           String   @id @default(uuid())
+  messageId    String
+  ipHash       String
+  userAgent    String   @default("")
+  succeeded    Boolean
+  reason       String   @default("")
+  accessedAt   DateTime @default(now())
+
+  message EphemeralMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId, accessedAt])
+}
+
+/// Persistent record of an ECDH key pair used for forward-secret messaging.
+///
+/// A new pair is created per-message (forward secrecy): leaking any single
+/// pair's private key never compromises previously sent messages because each
+/// message uses an independent shared secret derived via HKDF.  Revoking a
+/// pair marks every message that used it as unreadable.
+model KeyExchangePair {
+  id            String                @id @default(uuid())
+  ownerUserId   String
+  algorithm     KeyExchangeAlgorithm  @default(ECDH_P256)
+  publicKey     String
+  privateKey    String
+  fingerprint   String                @unique
+  state         KeyExchangePairState  @default(ACTIVE)
+  label         String                @default("")
+  createdAt     DateTime              @default(now())
+  rotatedAt     DateTime?
+  revokedAt     DateTime?
+  expiresAt     DateTime?
+
+  owner    User               @relation("KeyExchangePairs", fields: [ownerUserId], references: [id], onDelete: Cascade)
+  messages EphemeralMessage[]
+
+  @@index([ownerUserId, state])
+  @@index([state, createdAt])
+}
+
+/// A message the sender has explicitly allowed the recipient to retain in
+/// their biometric Vault.  The vault is bounded to 100 entries per user –
+/// `MessageVault.put` evicts the oldest row when that limit would be exceeded.
+model VaultedMessage {
+  id              String   @id @default(uuid())
+  ownerUserId     String
+  originalId      String?
+  subject         String
+  ciphertext      String
+  iv              String
+  authTag         String
+  algorithm       String   @default("AES-256-GCM")
+  wrappedKey      String
+  wrappedKeyIv    String
+  wrappedKeyTag   String
+  savedAt         DateTime @default(now())
+  lastAccessedAt  DateTime?
+  accessCount     Int      @default(0)
+
+  owner User @relation("VaultedMessages", fields: [ownerUserId], references: [id], onDelete: Cascade)
+
+  @@index([ownerUserId, savedAt])
 }
 
 // ─── Saccade Liveness (Quantedits Integration) ───────────────────
