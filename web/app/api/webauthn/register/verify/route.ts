@@ -189,22 +189,20 @@ export async function POST(request: Request) {
   await prisma.webAuthnCredential.upsert({
     where: { credentialId },
     update: {
-      publicKey: Buffer.from(registrationInfo.credential.publicKey),
+      publicKey: Buffer.from(registrationInfo.credential.publicKey).toString("base64url"),
       counter: registrationInfo.credential.counter,
       transports: serializeTransports(body.response.response.transports),
       deviceType: registrationInfo.credentialDeviceType,
       backedUp: registrationInfo.credentialBackedUp,
-      credentialType: body.response.type,
     },
     create: {
       userId: user.id,
       credentialId,
-      publicKey: Buffer.from(registrationInfo.credential.publicKey),
+      publicKey: Buffer.from(registrationInfo.credential.publicKey).toString("base64url"),
       counter: registrationInfo.credential.counter,
       transports: serializeTransports(body.response.response.transports),
       deviceType: registrationInfo.credentialDeviceType,
       backedUp: registrationInfo.credentialBackedUp,
-      credentialType: body.response.type,
     },
   });
 

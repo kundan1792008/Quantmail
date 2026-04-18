@@ -31,6 +31,7 @@ export const QUEUE_NAMES = {
   EMAIL: "email",
   WEBHOOK: "webhook",
   PUSH_NOTIFICATION: "push-notification",
+  STREAK_MAINTENANCE: "streak-maintenance",
 } as const;
 
 // ─── Job Data Shapes ──────────────────────────────────────────────
@@ -55,11 +56,19 @@ export interface PushNotificationJobData {
   payload?: Record<string, unknown>;
 }
 
+export interface StreakMaintenanceJobData {
+  /** Target UTC date (ISO string, midnight UTC).  Defaults to "today". */
+  forDate?: string;
+  /** Optional subset of users to process; empty = all active users. */
+  userIds?: string[];
+}
+
 // ─── Queue Instances ──────────────────────────────────────────────
 
 let emailQueue: Queue<EmailJobData> | null = null;
 let webhookQueue: Queue<WebhookJobData> | null = null;
 let pushNotificationQueue: Queue<PushNotificationJobData> | null = null;
+let streakMaintenanceQueue: Queue<StreakMaintenanceJobData> | null = null;
 
 /**
  * Lazily creates a BullMQ Queue, catching Redis connection errors gracefully.
@@ -97,6 +106,15 @@ export function getPushNotificationQueue(): Queue<PushNotificationJobData> | nul
     );
   }
   return pushNotificationQueue;
+}
+
+export function getStreakMaintenanceQueue(): Queue<StreakMaintenanceJobData> | null {
+  if (!streakMaintenanceQueue) {
+    streakMaintenanceQueue = createQueue<StreakMaintenanceJobData>(
+      QUEUE_NAMES.STREAK_MAINTENANCE
+    );
+  }
+  return streakMaintenanceQueue;
 }
 
 // ─── Enqueue Helpers ──────────────────────────────────────────────
@@ -165,6 +183,31 @@ export async function enqueuePushNotification(
     attempts: 2,
     backoff: { type: "fixed", delay: 3000 },
     removeOnComplete: 50,
+    removeOnFail: 100,
+  });
+}
+
+/**
+ * Adds a streak-maintenance job.  Typically scheduled via BullMQ
+ * repeatable jobs once per UTC day at 00:05 UTC.
+ */
+export async function enqueueStreakMaintenance(
+  data: StreakMaintenanceJobData = {}
+): Promise<void> {
+  const queue = getStreakMaintenanceQueue();
+  if (!queue) {
+    // Fallback: run inline so self-hosted dev setups without Redis
+    // still get streak maintenance.
+    const { runStreakMaintenance } = await import(
+      "./workers/streakMaintenanceWorker"
+    );
+    await runStreakMaintenance(data);
+    return;
+  }
+  await queue.add("streak-maintenance", data, {
+    attempts: 3,
+    backoff: { type: "exponential", delay: 5000 },
+    removeOnComplete: 30,
     removeOnFail: 100,
   });
 }

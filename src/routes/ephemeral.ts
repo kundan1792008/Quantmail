@@ -277,7 +277,15 @@ export async function ephemeralRoutes(app: FastifyInstance): Promise<void> {
    */
   app.post<{ Body: VaultUnlockTokenBody }>(
     "/vault/unlock-token",
-    { preHandler: requireAuth },
+    {
+      preHandler: requireAuth,
+      config: {
+        rateLimit: {
+          max: 5,
+          timeWindow: "1 minute",
+        },
+      },
+    },
     async (request, reply) => {
       const auth = (request as AuthedRequest).user;
       const body = request.body;

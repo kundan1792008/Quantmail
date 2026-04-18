@@ -5,6 +5,8 @@
   "main": "dist/server.js",
   "scripts": {
     "build": "npx prisma generate && tsc",
+    "prelint": "npm run prisma:generate",
+    "pretest": "npm run prisma:generate",
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
     "test": "vitest run",

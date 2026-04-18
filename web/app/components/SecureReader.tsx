@@ -141,7 +141,7 @@ async function importAesKey(keyB64Url: string): Promise<CryptoKey> {
   }
   return crypto.subtle.importKey(
     "raw",
-    raw,
+    raw as BufferSource,
     { name: "AES-GCM" },
     false,
     ["decrypt"]
@@ -160,9 +160,9 @@ async function decryptAesGcm(
   combined.set(ct, 0);
   combined.set(tag, ct.length);
   const plain = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv },
+    { name: "AES-GCM", iv: iv as BufferSource },
     key,
-    combined
+    combined as BufferSource
   );
   return new TextDecoder().decode(plain);
 }

@@ -16,7 +16,10 @@ export type WebhookEventType =
   | "user.verified"
   | "alarm.triggered"
   | "alarm.silenced"
-  | "push.dispatched";
+  | "push.dispatched"
+  | "streak.welcome_back"
+  | "streak.shield.granted"
+  | "streak.trinity.unlocked";
 
 export interface WebhookPayload {
   event: WebhookEventType;

@@ -68,8 +68,8 @@ export async function POST(request: Request) {
       expectedRPID: webAuthnConfig.rpID,
       credential: {
         id: credential.credentialId,
-        publicKey: credential.publicKey,
-        counter: credential.counter,
+        publicKey: Buffer.from(credential.publicKey, "base64url"),
+        counter: Number(credential.counter),
         transports: parseTransports(credential.transports),
       },
       requireUserVerification: true,
