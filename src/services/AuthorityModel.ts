@@ -28,7 +28,8 @@ export interface AuthorityAnalysis {
 
 const PASSIVE_PATTERNS: Array<{ pattern: RegExp; recommendation: string }> = [
   {
-    pattern: /\b(is|are|was|were|be|been|being)\s+\w+(ed|en)\b/gi,
+    pattern:
+      /\b(is|are|was|were|be|been|being)\s+((\w{4,}(ed|en))|known|given|seen|made|taken|built|held|sent)\b/gi,
     recommendation: "Prefer active framing with a clear owner and action.",
   },
 ];
@@ -52,6 +53,15 @@ const EXECUTIVE_PATTERNS: RegExp[] = [
   /\bdeliverable\b/i,
 ];
 
+const MAX_RECOMMENDED_WORDS_PER_SENTENCE = 35;
+const SEVERITY_PENALTY_MULTIPLIER = 4;
+const PASSIVE_FALSE_POSITIVE_PATTERNS: RegExp[] = [
+  /\bis known for\b/i,
+  /\bare known for\b/i,
+  /\bis given the opportunity\b/i,
+  /\bare given the opportunity\b/i,
+];
+
 function clamp(num: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, num));
 }
@@ -68,6 +78,21 @@ function collectPatternSignals(
     entry.pattern.lastIndex = 0;
     let match = entry.pattern.exec(text);
     while (match) {
+      if (match[0].length === 0) {
+        entry.pattern.lastIndex += 1;
+        match = entry.pattern.exec(text);
+        continue;
+      }
+      if (type === "passive-voice") {
+        const contextWindow = text.slice(
+          Math.max(0, match.index - 8),
+          Math.min(text.length, match.index + match[0].length + 24)
+        );
+        if (PASSIVE_FALSE_POSITIVE_PATTERNS.some((pattern) => pattern.test(contextWindow))) {
+          match = entry.pattern.exec(text);
+          continue;
+        }
+      }
       out.push({
         type,
         phrase: match[0],
@@ -105,7 +130,7 @@ function detectWeakStructure(text: string): AuthoritySignal[] {
   if (sentenceChunks.length > 0) {
     const longest = sentenceChunks.reduce((a, b) => (a.length >= b.length ? a : b));
     const wordCount = longest.trim().split(/\s+/).length;
-    if (wordCount > 35) {
+    if (wordCount > MAX_RECOMMENDED_WORDS_PER_SENTENCE) {
       const start = text.indexOf(longest);
       signals.push({
         type: "weak-structure",
@@ -155,7 +180,10 @@ export function analyzeAuthority(text: string): AuthorityAnalysis {
     (a, b) => a.start - b.start
   );
 
-  const penalty = signals.reduce((sum, signal) => sum + signal.severity * 4, 0);
+  const penalty = signals.reduce(
+    (sum, signal) => sum + signal.severity * SEVERITY_PENALTY_MULTIPLIER,
+    0
+  );
   const executiveAlignment = scoreExecutiveAlignment(text);
   const score = clamp(Math.round(100 - penalty + executiveAlignment * 20), 0, 100);
 
@@ -166,4 +194,3 @@ export function analyzeAuthority(text: string): AuthorityAnalysis {
 
   return { score, executiveAlignment, signals, summary };
 }
-

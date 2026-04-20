@@ -58,7 +58,7 @@ const DIRECT_REPLACEMENTS: Array<{
 
 function collapseWhitespace(text: string): string {
   return text
-    .replace(/[ \t]{2,}/g, " ")
+    .replace(/[^\S\r\n]{2,}/g, " ")
     .replace(/\s+([,.!?;:])/g, "$1")
     .trim();
 }
@@ -70,8 +70,13 @@ export function rewriteForAuthority(draft: string): DynamicRewriteResult {
 
   for (const item of DIRECT_REPLACEMENTS) {
     item.pattern.lastIndex = 0;
-    let match = item.pattern.exec(rewrittenText);
+    let match = item.pattern.exec(draft);
     while (match) {
+      if (match[0].length === 0) {
+        item.pattern.lastIndex += 1;
+        match = item.pattern.exec(draft);
+        continue;
+      }
       const replacement =
         typeof item.replacement === "function" ? item.replacement(match[0]) : item.replacement;
       suggestions.push({
@@ -81,16 +86,16 @@ export function rewriteForAuthority(draft: string): DynamicRewriteResult {
         replacement,
         reason: item.reason,
       });
-      match = item.pattern.exec(rewrittenText);
+      match = item.pattern.exec(draft);
     }
-    rewrittenText = rewrittenText.replace(item.pattern, (_, ...args: unknown[]) => {
-      const whole = String(args[args.length - 2] ?? "");
-      const matchText = typeof whole === "string" && whole.length > 0 ? whole : "";
-      if (typeof item.replacement === "function") {
-        return item.replacement(matchText);
-      }
-      return item.replacement;
-    });
+    if (typeof item.replacement === "function") {
+      const replacementFn = item.replacement;
+      rewrittenText = rewrittenText.replace(item.pattern, (matched) =>
+        replacementFn(matched)
+      );
+    } else {
+      rewrittenText = rewrittenText.replace(item.pattern, item.replacement);
+    }
   }
 
   rewrittenText = collapseWhitespace(rewrittenText);
@@ -104,4 +109,3 @@ export function rewriteForAuthority(draft: string): DynamicRewriteResult {
 export function suggestAuthorityRewrites(draft: string): RewriteSuggestion[] {
   return rewriteForAuthority(draft).suggestions;
 }
-

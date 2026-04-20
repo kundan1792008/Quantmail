@@ -68,4 +68,3 @@ describe("OutcomePredictor", () => {
     expect(hud.metrics.confidenceScore).toBeGreaterThan(0);
   });
 });
-
